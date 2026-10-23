@@ -43,7 +43,7 @@ def initialize_result(params):
         result["authMethods"] = [{"id": "tty", "name": "Terminal login", "type": "terminal"}]
         result["_meta"] = {"defaultAuthMethodId": "tty"}
     if MODE == "grok-meta":
-        assert params.get("_meta", {}).get("clientType") == "extension", params
+        assert "clientType" not in params.get("_meta", {}), params
     return result
 
 

@@ -175,9 +175,9 @@ async fn a_stop_answers_an_open_question_cancelled() {
 }
 
 /// Grok's cancel carries the user gesture; the fixture settles a gesture-less
-/// cancel as a refusal. Its initialize asserts the prompting client type.
+/// cancel as a refusal. Its initialize asserts no client type is declared.
 #[tokio::test]
-async fn grok_cancel_and_initialize_carry_their_meta() {
+async fn grok_cancel_carries_its_meta_and_initialize_names_no_client_type() {
     let mut run = start(&harness(), request("grok-meta")).await;
     run.until_text("working").await;
     run.turn.stop_turn();

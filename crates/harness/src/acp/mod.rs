@@ -2565,7 +2565,10 @@ fn initialize_params(harness: HarnessId) -> Value {
         // separate subagentControl extension: Zeron has no matching UI yet.
         capabilities["_meta"] = json!({ "cognition.ai/subagentSupport": true });
     }
-    let mut params = json!({
+    // Grok gets no `_meta.clientType`, deliberately: naming a client type
+    // that can show a prompt turns the actions its Auto-mode classifier
+    // denies into permission requests, which an auto-approve run would grant.
+    json!({
         "protocolVersion": 1,
         "clientInfo": {
             "name": "zeron",
@@ -2576,16 +2579,7 @@ fn initialize_params(harness: HarnessId) -> Value {
         // is what zeron wants — the working tree is the source of truth for
         // the diff pane, and commands belong to the agent's own sandbox.
         "clientCapabilities": capabilities,
-    });
-    if harness == HarnessId::Grok {
-        // Grok asks about an action its Auto-mode classifier blocks only when
-        // the client names a type that can show a prompt; the default type
-        // gets a silent denial the user never sees. The request it sends
-        // instead is accepted unasked only in an auto-approve run (see
-        // [`ToolPermissions::for_run`]).
-        params["_meta"] = json!({ "clientType": "extension" });
-    }
-    params
+    })
 }
 
 /// `session/cancel` params. Grok treats a cancel carrying a user gesture as
@@ -3126,10 +3120,8 @@ enum ToolPermissions {
 }
 
 impl ToolPermissions {
-    /// Grok, told its client can show a prompt (see [`initialize_params`]),
-    /// asks about the actions its own Auto-mode classifier blocks instead of
-    /// denying them. Accepting those unasked is only for a run that opted
-    /// into auto-approval; any other run asks the user.
+    /// A Grok permission request is accepted unasked only in a run that
+    /// opted into auto-approval; any other run asks the user.
     fn for_run(harness: HarnessId, request: &RunRequest) -> Self {
         if harness == HarnessId::Grok && !request.auto_approve {
             Self::Ask
@@ -6130,10 +6122,9 @@ mod tests {
             cancel_params(HarnessId::Devin, "s"),
             json!({ "sessionId": "s" })
         );
-        assert_eq!(
-            initialize_params(HarnessId::Grok)["_meta"],
-            json!({ "clientType": "extension" })
-        );
+        // No client type: it would turn Grok's classifier denials into
+        // permission requests (see `initialize_params`).
+        assert!(initialize_params(HarnessId::Grok).get("_meta").is_none());
         assert!(initialize_params(HarnessId::Hermes).get("_meta").is_none());
     }
 
