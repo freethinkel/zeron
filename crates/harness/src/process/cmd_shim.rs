@@ -25,6 +25,7 @@ pub(crate) enum ShimTarget {
 }
 
 /// cmd-shim files are a few hundred bytes; anything larger is not one.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub(crate) const MAX_SHIM_BYTES: u64 = 16 * 1024;
 
 /// Statements cmd-shim writes around the launch line, lowercased, with the

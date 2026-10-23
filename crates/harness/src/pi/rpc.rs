@@ -39,6 +39,8 @@ pub(super) struct Transport {
     reader: JoinHandle<()>,
     writer: JoinHandle<()>,
     /// Ends the writer (and Pi's stdin) once the frames queued are written.
+    /// Only Windows' teardown needs it.
+    #[cfg_attr(not(windows), allow(dead_code))]
     close_input: Arc<tokio::sync::Notify>,
 }
 impl Drop for Transport {

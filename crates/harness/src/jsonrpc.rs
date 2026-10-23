@@ -79,6 +79,8 @@ pub(crate) struct RpcClient {
     voice_router: Arc<Mutex<Option<VoiceRouter>>>,
     /// Ends the writer task (and with it the child's stdin) once the lines
     /// already queued are written, whichever clones are still alive.
+    /// Only Windows' teardown needs it.
+    #[cfg_attr(not(any(windows, test)), allow(dead_code))]
     close_stdin: Arc<tokio::sync::Notify>,
 }
 
