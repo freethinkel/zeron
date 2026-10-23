@@ -408,13 +408,21 @@ async fn resumed_first_class_model_is_switched_before_prompt() {
 
 #[tokio::test]
 async fn permission_requests_auto_accept_the_preferred_allow_option() {
-    let (controls, _steer, _token) = controls();
-    let events = run_to_end(&harness(), request("scenario:permission"), controls).await;
-    // The fixture answers refusal unless the harness selected "always".
-    assert!(events.contains(&AgentEvent::TextDelta {
-        text: "approved".into()
-    }));
-    assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    // Whatever the run's auto_approve: a Grok edit never waits on the user.
+    for auto_approve in [true, false] {
+        let (controls, _steer, _token) = controls();
+        let mut req = request("scenario:permission");
+        req.auto_approve = auto_approve;
+        let events = run_to_end(&harness(), req, controls).await;
+        // The fixture answers refusal unless the harness selected "always".
+        assert!(
+            events.contains(&AgentEvent::TextDelta {
+                text: "approved".into()
+            }),
+            "auto_approve {auto_approve}: {events:?}"
+        );
+        assert_eq!(dones(&events), vec![(DoneStatus::Completed, None)]);
+    }
 }
 
 #[tokio::test]

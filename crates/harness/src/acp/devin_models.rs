@@ -56,14 +56,7 @@ pub(super) async fn wait_for_model(
                     }
                 }
                 Some(Incoming::Request { id, method, params }) => {
-                    // Devin's tool permissions follow the unattended default.
-                    super::handle_server_request(
-                        client,
-                        id,
-                        &method,
-                        &params,
-                        super::ToolPermissions::Approve,
-                    );
+                    super::handle_server_request(client, id, &method, &params);
                 }
                 Some(_) => {}
                 None => {
