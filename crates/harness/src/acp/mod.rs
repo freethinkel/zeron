@@ -1328,7 +1328,14 @@ impl AcpHarness {
             client
                 .request("initialize", initialize_params(self.spec.id))
                 .await?;
-            request_draining(&client, &mut incoming, "logout", json!({})).await
+            request_draining(
+                &client,
+                &mut incoming,
+                "logout",
+                json!({}),
+                ToolPermissions::Approve,
+            )
+            .await
         };
         let result = tokio::time::timeout(SIGN_OUT_TIMEOUT, flow).await;
         client.close_stdin_for_teardown();
@@ -1472,6 +1479,7 @@ impl AcpHarness {
                 &mut incoming,
                 "authenticate",
                 json!({ "methodId": method }),
+                ToolPermissions::Approve,
             )
             .await
         };
@@ -2573,7 +2581,8 @@ fn initialize_params(harness: HarnessId) -> Value {
         // Grok asks about an action its Auto-mode classifier blocks only when
         // the client names a type that can show a prompt; the default type
         // gets a silent denial the user never sees. The request it sends
-        // instead is answered like every other permission request.
+        // instead is accepted unasked only in an auto-approve run (see
+        // [`ToolPermissions::for_run`]).
         params["_meta"] = json!({ "clientType": "extension" });
     }
     params
@@ -3106,10 +3115,35 @@ impl PromptInput {
     }
 }
 
+/// How a run answers the agent's tool-permission requests.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolPermissions {
+    /// Accept with the agent's preferred allow option (unattended parity).
+    Approve,
+    /// Ask the user through the input bridge; where none is open (a setup
+    /// or control call's drain), decline.
+    Ask,
+}
+
+impl ToolPermissions {
+    /// Grok, told its client can show a prompt (see [`initialize_params`]),
+    /// asks about the actions its own Auto-mode classifier blocks instead of
+    /// denying them. Accepting those unasked is only for a run that opted
+    /// into auto-approval; any other run asks the user.
+    fn for_run(harness: HarnessId, request: &RunRequest) -> Self {
+        if harness == HarnessId::Grok && !request.auto_approve {
+            Self::Ask
+        } else {
+            Self::Approve
+        }
+    }
+}
+
 /// Answer a server→client request. Permission requests are auto-accepted with
 /// the agent's preferred allow option — parity with the claude harness's
 /// bypassPermissions and the codex harness's approvalPolicy "never" (zeron
-/// sessions run unattended). Everything else (fs, terminal, elicitation) was
+/// sessions run unattended) — unless `tools` asks, which has no one to ask
+/// here and declines. Everything else (fs, terminal, elicitation) was
 /// declined at initialize, so a stray request gets method-not-found rather
 /// than wedging the agent.
 fn handle_server_request(
@@ -3117,8 +3151,13 @@ fn handle_server_request(
     id: Value,
     method: &str,
     params: &Value,
+    tools: ToolPermissions,
 ) -> Vec<AgentEvent> {
     match method {
+        "session/request_permission" if tools == ToolPermissions::Ask => {
+            client.respond(&id, json!({ "outcome": { "outcome": "cancelled" } }));
+            Vec::new()
+        }
         "session/request_permission" => {
             let options: Vec<Value> = params
                 .get("options")
@@ -3213,10 +3252,12 @@ impl PendingQuestions {
 }
 
 /// The live-run request handler: tool permissions auto-accept like
-/// [`handle_server_request`], but question-shaped requests block on the
-/// engine's input bridge (in a subtask so the message loop keeps flowing)
-/// and answer with the option whose name matches the chosen label. A dropped
-/// resolver degrades to `cancelled` — never a silent allow.
+/// [`handle_server_request`], but question-shaped requests (and every
+/// permission request when `tools` asks) block on the engine's input bridge
+/// (in a subtask so the message loop keeps flowing) and answer with the
+/// option whose name matches the chosen label. A dropped resolver degrades
+/// to `cancelled` — never a silent allow.
+#[allow(clippy::too_many_arguments)]
 fn handle_server_request_live(
     client: &RpcClient,
     id: Value,
@@ -3225,6 +3266,7 @@ fn handle_server_request_live(
     request_input: &std::sync::Arc<RequestInputFn>,
     session_id: &str,
     questions: &mut PendingQuestions,
+    tools: ToolPermissions,
 ) -> Vec<AgentEvent> {
     if params
         .get("sessionId")
@@ -3235,15 +3277,16 @@ fn handle_server_request_live(
         return Vec::new();
     }
     if method != "session/request_permission" {
-        return handle_server_request(client, id, method, params);
+        return handle_server_request(client, id, method, params, tools);
     }
     let options: Vec<Value> = params
         .get("options")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if !is_user_question(&options) {
-        return handle_server_request(client, id, method, params);
+    let question_shaped = is_user_question(&options);
+    if !question_shaped && tools == ToolPermissions::Approve {
+        return handle_server_request(client, id, method, params, tools);
     }
     let names: Vec<String> = options
         .iter()
@@ -3256,7 +3299,12 @@ fn handle_server_request_live(
         .collect();
     let question = UserInputQuestion {
         id: new_message_id(),
-        header: "Agent question".into(),
+        header: if question_shaped {
+            "Agent question"
+        } else {
+            "Permission request"
+        }
+        .into(),
         question: params
             .get("toolCall")
             .and_then(|t| t.get("title"))
@@ -3408,6 +3456,7 @@ async fn open_session(
     agent_name: &str,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) -> Result<(String, Value), HarnessError> {
+    let tools = ToolPermissions::for_run(harness, request);
     let params = json!({
         "cwd": request.cwd,
         "mcpServers": acp_mcp_servers(request.mcp.as_ref()),
@@ -3419,7 +3468,7 @@ async fn open_session(
         let restored = if method == "session/load" {
             tokio::time::timeout(
                 SESSION_LOAD_TIMEOUT,
-                request_draining(client, incoming, method, restore),
+                request_draining(client, incoming, method, restore, tools),
             )
             .await
             .unwrap_or_else(|_| {
@@ -3429,7 +3478,7 @@ async fn open_session(
                 )))
             })
         } else {
-            request_draining(client, incoming, method, restore).await
+            request_draining(client, incoming, method, restore, tools).await
         };
         match restored {
             Ok(response) => return Ok((resume.clone(), response)),
@@ -3446,7 +3495,7 @@ async fn open_session(
             }
         }
     }
-    let new = request_draining(client, incoming, "session/new", params).await?;
+    let new = request_draining(client, incoming, "session/new", params, tools).await?;
     let session_id = new
         .get("sessionId")
         .and_then(Value::as_str)
@@ -3484,6 +3533,7 @@ async fn authenticate_for_run(
     init: &Value,
     agent_name: &str,
     required: &HarnessError,
+    tools: ToolPermissions,
 ) -> Result<(), HarnessError> {
     let method = match run_auth_method(init) {
         Ok(Some(method)) => method,
@@ -3500,6 +3550,7 @@ async fn authenticate_for_run(
         incoming,
         "authenticate",
         json!({ "methodId": method }),
+        tools,
     )
     .await
     .map(|_| ())
@@ -3667,6 +3718,7 @@ async fn request_draining(
     incoming: &mut mpsc::Receiver<Incoming>,
     method: &'static str,
     params: Value,
+    tools: ToolPermissions,
 ) -> Result<Value, HarnessError> {
     let loading_session = matches!(method, "session/new" | "session/load" | "session/resume");
     let requested_session = params
@@ -3681,7 +3733,7 @@ async fn request_draining(
             {
                 client.respond(&id, json!({"outcome": {"outcome": "cancelled"}}));
             } else {
-                handle_server_request(client, id, &method, &params);
+                handle_server_request(client, id, &method, &params, tools);
             }
         }
         Incoming::Notification { method, params }
@@ -3775,10 +3827,11 @@ async fn control_request(
     incoming: &mut mpsc::Receiver<Incoming>,
     method: &'static str,
     params: Value,
+    tools: ToolPermissions,
 ) -> Result<Value, HarnessError> {
     tokio::time::timeout(
         CONTROL_REQUEST_TIMEOUT,
-        request_draining(client, incoming, method, params),
+        request_draining(client, incoming, method, params, tools),
     )
     .await
     .unwrap_or_else(|_| {
@@ -3898,6 +3951,7 @@ async fn select_session_config(
                 "sessionId": session_id,
                 "modelId": model,
             }),
+            ToolPermissions::for_run(rules.harness, &request),
         )
         .await
         .map_err(|error| {
@@ -3945,6 +3999,7 @@ async fn select_session_config(
                 incoming,
                 "session/set_config_option",
                 Value::Object(params),
+                ToolPermissions::for_run(rules.harness, &request),
             )
             .await
             {
@@ -4070,7 +4125,15 @@ async fn run_session(session: Session) {
                 }
                 Err(e) if is_auth_required(&e) && !authenticated => {
                     authenticated = true;
-                    authenticate_for_run(&client, &mut incoming, &init, agent_name, &e).await?;
+                    authenticate_for_run(
+                        &client,
+                        &mut incoming,
+                        &init,
+                        agent_name,
+                        &e,
+                        ToolPermissions::for_run(harness, &request),
+                    )
+                    .await?;
                 }
                 Err(e) if is_auth_required(&e) => {
                     return Err(HarnessError::Protocol(signed_out(agent_name, &e)));
@@ -4509,6 +4572,7 @@ async fn run_session(session: Session) {
                                 &params,
                                 &request_input,
                                 &session_id, &mut questions,
+                                ToolPermissions::for_run(harness, &request),
                             ) {
                                 if !send(&event_tx, ev).await {
                                     consumer_gone = true;
@@ -4735,6 +4799,7 @@ async fn run_session(session: Session) {
                         &params,
                         &request_input,
                         &session_id, &mut questions,
+                        ToolPermissions::for_run(harness, &request),
                     ) {
                         if !send(&event_tx, ev).await {
                             break 'main;
@@ -4845,6 +4910,7 @@ async fn run_session(session: Session) {
                                         &params,
                                         &request_input,
                                 &session_id, &mut questions,
+                                        ToolPermissions::for_run(harness, &request),
                                     ) {
                                         if !send(&event_tx, ev).await {
                                             consumer_gone = true;
@@ -6539,6 +6605,118 @@ mod tests {
         assert!(is_user_question(&mixed));
     }
 
+    fn run_request(auto_approve: bool) -> RunRequest {
+        serde_json::from_value(json!({
+            "prompt": "go", "model": null, "reasoning": null, "cwd": "/tmp",
+            "sandbox": "workspace-write", "autoApprove": auto_approve, "resume": null,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn only_grok_without_auto_approve_asks_about_tools() {
+        let ask = ToolPermissions::for_run;
+        assert_eq!(
+            ask(HarnessId::Grok, &run_request(false)),
+            ToolPermissions::Ask
+        );
+        assert_eq!(
+            ask(HarnessId::Grok, &run_request(true)),
+            ToolPermissions::Approve
+        );
+        assert_eq!(
+            ask(HarnessId::Devin, &run_request(false)),
+            ToolPermissions::Approve
+        );
+    }
+
+    /// Grok's shape for an action its Auto-mode classifier blocked.
+    fn blocked_action() -> Value {
+        json!({
+            "sessionId": "s-1",
+            "toolCall": { "toolCallId": "t-1", "title": "rm -rf build" },
+            "options": [
+                { "optionId": "allow", "name": "Allow", "kind": "allow_once" },
+                { "optionId": "deny", "name": "Deny", "kind": "reject_once" },
+            ],
+        })
+    }
+
+    fn answered(line: Option<String>) -> Value {
+        let frame: Value = serde_json::from_str(&line.expect("an answer")).unwrap();
+        frame["result"]["outcome"].clone()
+    }
+
+    #[tokio::test]
+    async fn an_asking_run_puts_a_tool_permission_to_the_user() {
+        let (client, mut lines) = RpcClient::capturing();
+        let (asked_tx, mut asked) = mpsc::unbounded_channel();
+        let (answer_tx, answer_rx) = tokio::sync::oneshot::channel();
+        let answer_rx = std::sync::Mutex::new(Some(answer_rx));
+        let request_input: std::sync::Arc<RequestInputFn> =
+            std::sync::Arc::new(Box::new(move |questions| {
+                asked_tx.send(questions).unwrap();
+                answer_rx.lock().unwrap().take().unwrap()
+            }));
+        let mut questions = PendingQuestions::default();
+        handle_server_request_live(
+            &client,
+            json!(7),
+            "session/request_permission",
+            &blocked_action(),
+            &request_input,
+            "s-1",
+            &mut questions,
+            ToolPermissions::Ask,
+        );
+        let asked = asked.recv().await.unwrap();
+        assert_eq!(asked[0].header, "Permission request");
+        assert_eq!(asked[0].question, "rm -rf build");
+        assert_eq!(asked[0].options, ["Allow", "Deny"]);
+        assert!(
+            lines.try_recv().is_err(),
+            "nothing is answered before the user"
+        );
+        answer_tx
+            .send(vec![UserInputAnswer {
+                question_id: asked[0].id.clone(),
+                labels: vec!["Deny".into()],
+            }])
+            .unwrap();
+        assert_eq!(
+            answered(lines.recv().await),
+            json!({ "outcome": "selected", "optionId": "deny" })
+        );
+    }
+
+    #[test]
+    fn tool_permissions_accept_unasked_only_when_approving() {
+        let (client, mut lines) = RpcClient::capturing();
+        handle_server_request(
+            &client,
+            json!(1),
+            "session/request_permission",
+            &blocked_action(),
+            ToolPermissions::Approve,
+        );
+        assert_eq!(
+            answered(lines.try_recv().ok()),
+            json!({ "outcome": "selected", "optionId": "allow" })
+        );
+        // A drain has no one to ask: an asking run declines.
+        handle_server_request(
+            &client,
+            json!(2),
+            "session/request_permission",
+            &blocked_action(),
+            ToolPermissions::Ask,
+        );
+        assert_eq!(
+            answered(lines.try_recv().ok()),
+            json!({ "outcome": "cancelled" })
+        );
+    }
+
     #[test]
     fn mode_config_option_prefers_a_no_prompt_mode_per_adapter_naming() {
         let codex = json!({
@@ -6819,7 +6997,13 @@ async fn setup_retains_bounded_session_metadata_before_response() {
         RpcClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
     let result = tokio::time::timeout(
         Duration::from_secs(5),
-        request_draining(&client, &mut incoming, "session/new", json!({})),
+        request_draining(
+            &client,
+            &mut incoming,
+            "session/new",
+            json!({}),
+            ToolPermissions::Approve,
+        ),
     )
     .await
     .unwrap()

@@ -128,6 +128,22 @@ impl RpcClient {
         )
     }
 
+    /// A client with no child: every line it would write lands in the
+    /// returned receiver instead.
+    #[cfg(test)]
+    pub(crate) fn capturing() -> (Self, mpsc::UnboundedReceiver<String>) {
+        let (writer, lines) = mpsc::unbounded_channel();
+        let client = Self {
+            next_id: Arc::new(AtomicI64::new(0)),
+            pending: Arc::default(),
+            writer,
+            closed: Arc::new(AtomicBool::new(false)),
+            voice_router: Arc::default(),
+            close_stdin: Arc::default(),
+        };
+        (client, lines)
+    }
+
     /// Route `thread/realtime/*` notifications (and `account/updated`) to a
     /// voice channel so stdout never waits for playout. Overflow is terminal:
     /// the flag is set and `abort_media` runs.
