@@ -15,6 +15,7 @@ struct TurnWire {
     requests: mpsc::UnboundedReceiver<String>,
     events: mpsc::Receiver<Result<AgentEvent, HarnessError>>,
     interrupt: tokio_util::sync::CancellationToken,
+    turn: crate::TurnControl,
     steering: Option<mpsc::Sender<crate::SteerMessage>>,
     polls: Arc<std::sync::atomic::AtomicUsize>,
     /// SSE connections accepted (a reconnect adds one).
@@ -314,6 +315,7 @@ impl TurnWire {
             .unwrap_or(false)
             .then_some(steer_tx);
         let interrupt = tokio_util::sync::CancellationToken::new();
+        let turn = crate::TurnControl::default();
         let mut request = json!({"prompt": if native_command_reply.is_some() { "/project-review" } else { "first" }, "cwd":"", "sandbox":"workspace-write", "autoApprove": auto_approve, "model": if v2 { Some("opencode/muse") } else { None }, "reasoning": "low"});
         request
             .as_object_mut()
@@ -341,7 +343,7 @@ impl TurnWire {
                 }),
                 steering,
                 interrupt: interrupt.clone(),
-                turn: Default::default(),
+                turn: turn.clone(),
             },
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),
@@ -364,6 +366,7 @@ impl TurnWire {
             requests,
             events,
             interrupt,
+            turn,
             steering: retained_steering,
             polls,
             bus_connections,
@@ -2669,6 +2672,46 @@ async fn unanswered_prompt_found_by_its_message_id_is_not_reposted() {
         .filter(|(p, _)| p.ends_with("/prompt_async"))
         .count();
     assert_eq!(prompts, 1);
+}
+
+/// A prompt whose POST died unanswered is posted again only while its turn
+/// is live: after a stop or an interrupt, the retry never goes out (it
+/// would start the stopped turn over on the server).
+#[tokio::test]
+async fn a_stopped_prompt_is_never_posted_again() {
+    for interrupt in [false, true] {
+        let mut wire = TurnWire::start_config(
+            false,
+            false,
+            true,
+            None,
+            "1.18.31",
+            json!({"dropPrompt": true, "keepSteering": true}),
+            false,
+        )
+        .await;
+        wire.request("/prompt_async").await;
+        if interrupt {
+            wire.interrupt.cancel();
+        } else {
+            wire.turn.stop_turn();
+        }
+        wire.request("/abort").await;
+        wire.status("idle");
+        wire.idle();
+        assert_eq!(wire.done().await.0, DoneStatus::Interrupted);
+        // Past the retry delay and its landed check.
+        tokio::time::sleep(PROMPT_RETRY_DELAY * 3).await;
+        let prompts = wire
+            .posts
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(p, _)| p.ends_with("/prompt_async"))
+            .count();
+        assert_eq!(prompts, 1, "interrupt: {interrupt}");
+        assert!(wire.events.try_recv().is_err(), "interrupt: {interrupt}");
+    }
 }
 
 #[tokio::test]

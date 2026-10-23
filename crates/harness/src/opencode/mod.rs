@@ -111,8 +111,8 @@ const BUS_SILENCE: Duration = Duration::from_secs(45);
 /// each refused loopback connect costs about 2s on Windows.
 const SERVER_POLL: Duration = Duration::from_millis(500);
 
-/// Prompt deliveries: one retry. 2.x admits a repeated message id once, and
-/// 1.x is checked for the message before posting it again.
+/// Prompt deliveries: one retry, posted only once the session is checked
+/// for the message (see [`deliver_prompt`]).
 const PROMPT_ATTEMPTS: u32 = 2;
 const PROMPT_RETRY_DELAY: Duration = Duration::from_millis(500);
 
@@ -2082,6 +2082,9 @@ async fn run_session(session: Session) {
     let stall = stall_bound();
     let (updates_tx, mut updates_rx) = mpsc::unbounded_channel::<TurnUpdate>();
     let mut turn_generation = 0_u64;
+    // The live prompt's delivery: a stop or interrupt cancels it, so a
+    // retry can never post the stopped prompt again.
+    let mut delivery = tokio_util::sync::CancellationToken::new();
     let first_post = post_prompt(
         &server,
         &session_id,
@@ -2091,6 +2094,7 @@ async fn run_session(session: Session) {
         initial_native_command_selected,
         turn_generation,
         &updates_tx,
+        &delivery,
         TurnSpec {
             model: model.as_ref(),
             variant: variant.as_deref(),
@@ -2227,6 +2231,7 @@ async fn run_session(session: Session) {
                         .map(|selection| (model, variant) = selection),
                     None => Ok(()),
                 };
+                delivery = tokio_util::sync::CancellationToken::new();
                 let sent = match adopted {
                     Ok(()) => post_prompt(
                         &server,
@@ -2237,6 +2242,7 @@ async fn run_session(session: Session) {
                         native_command_selected,
                         turn_generation,
                         &updates_tx,
+                        &delivery,
                         TurnSpec {
                             model: model.as_ref(),
                             variant: variant.as_deref(),
@@ -2446,6 +2452,7 @@ async fn run_session(session: Session) {
                 queued_steers.clear();
                 if turn.active && !stopping {
                     stopping = true;
+                    delivery.cancel();
                     turn.idle_ready = true;
                     let abort = tokio::time::timeout(
                         Duration::from_secs(5),
@@ -2480,6 +2487,7 @@ async fn run_session(session: Session) {
 
             _ = interrupt.cancelled(), if !interrupt_requested => {
                 interrupt_requested = true;
+                delivery.cancel();
                 if turn.active {
                     turn.idle_ready = true;
                     let abort = tokio::time::timeout(
@@ -2623,6 +2631,7 @@ async fn run_session(session: Session) {
                                     .map(|selection| (model, variant) = selection),
                                 None => Ok(()),
                             };
+                            delivery = tokio_util::sync::CancellationToken::new();
                             let sent = match adopted {
                                 Ok(()) => post_prompt(
                                     &server,
@@ -2633,6 +2642,7 @@ async fn run_session(session: Session) {
                                     native_command_selected,
                                     turn_generation,
                                     &updates_tx,
+                                    &delivery,
                                     TurnSpec {
                                         model: model.as_ref(),
                                         variant: variant.as_deref(),
@@ -2807,6 +2817,8 @@ async fn run_session(session: Session) {
         }
     }
 
+    // A run that ended mid-delivery never posts its prompt again.
+    delivery.cancel();
     if stop_teardown {
         // Close the mailbox before the stop reads settled: the next prompt
         // must start a fresh runtime, never land in this one.
@@ -3138,7 +3150,9 @@ fn command_body_v2(
 /// delivers the actual turn.
 ///
 /// `Ok(true)`: a prompt whose acceptance (or failure) `updates` will carry;
-/// `Ok(false)`: a native command, which reports only failure.
+/// `Ok(false)`: a native command, which reports only failure. Cancelling
+/// `delivery` (the turn was stopped) ends a prompt's delivery: it is never
+/// posted again, and nothing is reported.
 #[allow(clippy::too_many_arguments)]
 async fn post_prompt(
     server: &Server,
@@ -3149,6 +3163,7 @@ async fn post_prompt(
     native_command_selected: bool,
     turn_generation: u64,
     updates: &mpsc::UnboundedSender<TurnUpdate>,
+    delivery: &tokio_util::sync::CancellationToken,
     spec: TurnSpec<'_>,
 ) -> Result<bool, HarnessError> {
     let TurnSpec {
@@ -3228,19 +3243,24 @@ async fn post_prompt(
     let session_id = session_id.to_owned();
     let updates = updates.clone();
     let dir = dir.map(str::to_owned);
+    let delivery = delivery.clone();
     // The bus owns turn completion. A stalled HTTP acknowledgement must not
     // prevent cancellation or event consumption; each POST is bounded.
     tokio::spawn(async move {
-        let signal = match deliver_prompt(
+        let delivered = deliver_prompt(
             &server,
             &path,
             &body,
             &session_id,
             &message_id,
             dir.as_deref(),
+            &delivery,
         )
-        .await
-        {
+        .await;
+        if delivery.is_cancelled() {
+            return;
+        }
+        let signal = match delivered {
             Ok(()) => TurnSignal::PromptAccepted,
             Err(message) => TurnSignal::PromptFailed(message),
         };
@@ -3256,9 +3276,11 @@ async fn post_prompt(
 /// A timeout, a dropped connection or a 5xx is ambiguous — the server may
 /// have queued the prompt and only the answer was lost — so before posting
 /// again (and before giving up) the session is checked for it: running, or
-/// holding the message under the id we minted. A repeat is therefore never
-/// a duplicate turn: 2.x admits an id once anyway, and 1.x only gets the
-/// prompt again when it has no message under that id.
+/// holding the message under the id we minted, and only a prompt it does
+/// not have is posted again. That check, not the server, is what keeps a
+/// repeat from being a duplicate turn: 2.x does not reject a known id, it
+/// answers 200 and updates the stored message in place (verified live,
+/// 2.1.2). A stopped turn's prompt (`cancel`) is never posted again.
 async fn deliver_prompt(
     server: &Server,
     path: &str,
@@ -3266,19 +3288,24 @@ async fn deliver_prompt(
     session_id: &str,
     message_id: &str,
     dir: Option<&str>,
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<(), String> {
     let mut last_error = String::new();
     for attempt in 0..PROMPT_ATTEMPTS {
         if attempt > 0 {
-            tokio::time::sleep(PROMPT_RETRY_DELAY * attempt).await;
+            tokio::select! {
+                _ = cancel.cancelled() => return Err("prompt delivery cancelled".into()),
+                _ = tokio::time::sleep(PROMPT_RETRY_DELAY * attempt) => {}
+            }
             if server.prompt_landed(session_id, message_id, dir).await {
                 return Ok(());
+            }
+            if cancel.is_cancelled() {
+                return Err("prompt delivery cancelled".into());
             }
         }
         match server.post_json_raw(path, dir, body).await {
             Ok((status, _)) if status.is_success() => return Ok(()),
-            // A retried id the server already admitted conflicts (2.x).
-            Ok((reqwest::StatusCode::CONFLICT, _)) if attempt > 0 => return Ok(()),
             Ok((status, text)) if status.is_client_error() => {
                 return Err(post_error_message(path, status, &text));
             }
