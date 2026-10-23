@@ -745,7 +745,8 @@ async fn fresh_crash_auto_resumes_and_notes_the_interruption() {
     ));
     // The revived run continues the journal-recovered harness conversation.
     // That session already holds the request and the partial work on it, so
-    // the provider gets a continuation, never the request a second time.
+    // the provider gets a continuation, never the bare request a second time
+    // (it rides along only for reference, should the session have started over).
     // (An auto-title request may precede it — titling fires at dispatch.)
     let recorded = requests.lock().unwrap().clone();
     assert!(

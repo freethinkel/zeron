@@ -615,6 +615,12 @@ async fn a_graceful_shutdown_mid_turn_is_picked_back_up() {
             "the session already holds the request: {:?}",
             log[0].prompt
         );
+        // Still carried, should the resumed session have started over.
+        assert!(
+            log[0].prompt.contains("<request>\nlong task\n</request>"),
+            "{:?}",
+            log[0].prompt
+        );
         assert_eq!(log[0].resume.as_deref(), Some("hs-held"));
     }
     // Still one user message, in the user's own words.

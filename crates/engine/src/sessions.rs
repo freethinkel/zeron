@@ -1578,7 +1578,7 @@ impl SessionsEngine {
             // reply has none of its own). Dispatch drops the continuation
             // again if no session resumes.
             let continuation = (tail.reached_provider && answered_in(&entries, &user_id))
-                .then(|| revival_prompt(harness_id, &prompt_text));
+                .then(|| revival_prompt(&prompt_text));
             lock(&self.inner.revivals).insert(
                 chat_id.clone(),
                 Revival {
@@ -2705,23 +2705,20 @@ fn answered_in(entries: &[SessionMessageEntry], user_id: &str) -> bool {
 }
 
 /// What a revived run sends a provider session that already holds the
-/// interrupted turn: a nudge to carry on, not the request again (read twice,
-/// it looks like new work, and finished side effects get redone). Cursor's
-/// SDK can lose a turn it never checkpointed, so its nudge carries the
-/// request for reference.
-fn revival_prompt(harness: HarnessId, original: &str) -> String {
-    const NUDGE: &str = "Your previous turn was cut off before it finished (Zeron \
-                         restarted). Continue where you left off. Anything you already \
-                         completed, such as edits, commands or commits, is done: check \
-                         before repeating it.";
-    if harness == HarnessId::Cursor {
-        format!(
-            "{NUDGE} If the request below is not in your history yet, handle it now.\n\n\
-             <request>\n{original}\n</request>"
-        )
-    } else {
-        NUDGE.to_owned()
-    }
+/// interrupted turn: a nudge to carry on, not a bare repeat of the request
+/// (read twice, it looks like new work, and finished side effects get
+/// redone). The request still rides along, for reference: the session that
+/// receives this is not always the one that holds the turn — a provider can
+/// lose a turn it never checkpointed, or quietly start a new session when
+/// its resume fails — and without it that session would get only the nudge.
+fn revival_prompt(original: &str) -> String {
+    format!(
+        "Your previous turn was cut off before it finished (Zeron restarted). Continue \
+         where you left off. Anything you already completed, such as edits, commands or \
+         commits, is done: check before repeating it. The request is below for \
+         reference; if it is not in your history yet, handle it now.\n\n\
+         <request>\n{original}\n</request>"
+    )
 }
 
 /// The note a turn the engine's own shutdown cut off ends with.
@@ -5550,11 +5547,11 @@ mod tests {
     }
 
     #[test]
-    fn revival_prompt_carries_the_request_only_where_it_can_be_lost() {
-        let nudge = revival_prompt(HarnessId::ClaudeCode, "refactor the parser");
+    fn revival_prompt_carries_the_request_for_a_session_that_started_over() {
+        let nudge = revival_prompt("refactor the parser");
         assert!(nudge.contains("Continue where you left off"));
-        assert!(!nudge.contains("refactor the parser"));
-        let cursor = revival_prompt(HarnessId::Cursor, "refactor the parser");
-        assert!(cursor.contains("<request>\nrefactor the parser\n</request>"));
+        assert!(nudge.contains("check before repeating it"));
+        assert!(nudge.contains("if it is not in your history yet, handle it now"));
+        assert!(nudge.ends_with("<request>\nrefactor the parser\n</request>"));
     }
 }
