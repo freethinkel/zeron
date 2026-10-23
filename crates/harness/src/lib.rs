@@ -370,9 +370,11 @@ fn compose_path<'a>(
 }
 
 /// The child PATH's entries in precedence order. Unix puts the login shell's
-/// PATH before our own: a Dock/launchd launch inherits only the system PATH,
-/// whose `/usr/bin` stubs would otherwise shadow the user's Homebrew or nvm
-/// toolchain. Windows keeps its own PATH first (it already came from the
+/// PATH before our own only when ours is a bare system PATH: a Dock/launchd
+/// launch inherits just that, whose `/usr/bin` stubs would otherwise shadow
+/// the user's Homebrew or nvm toolchain. A PATH set up on purpose (a venv,
+/// nix, direnv or nvm in the launching terminal, a service unit's own) keeps
+/// precedence (see [`executable::is_bare_system_path`]). Windows keeps its own PATH first (it already came from the
 /// user's environment, plus per-session additions like fnm's) and adds what
 /// the registry gained since we started, then the node-manager directories
 /// discovery searched, so `node`/`npx` MCP servers resolve like the CLI did.
@@ -388,12 +390,12 @@ fn child_path_entries(
             .unwrap_or_default()
     };
     let mut paths = executable_dir;
-    if platform == executable::Platform::Windows {
-        paths.extend(split(own));
+    if platform == executable::Platform::Unix && executable::is_bare_system_path(own) {
         paths.extend(split(user));
+        paths.extend(split(own));
     } else {
-        paths.extend(split(user));
         paths.extend(split(own));
+        paths.extend(split(user));
     }
     paths.extend(node_dirs);
     let mut seen = std::collections::HashSet::new();
@@ -735,6 +737,46 @@ mod path_tests {
             ]
             .map(PathBuf::from)
         );
+    }
+
+    #[test]
+    fn unix_child_path_keeps_a_deliberate_process_path_first() {
+        let own = joined(&["/home/a/project/.venv/bin", "/usr/bin", "/bin"]);
+        let user = joined(&["/opt/homebrew/bin", "/usr/bin"]);
+        let paths = child_path_entries(
+            Platform::Unix,
+            Vec::new(),
+            Some(&own),
+            Some(&user),
+            Vec::new(),
+        );
+        assert_eq!(
+            paths,
+            [
+                "/home/a/project/.venv/bin",
+                "/usr/bin",
+                "/bin",
+                "/opt/homebrew/bin"
+            ]
+            .map(PathBuf::from)
+        );
+        // A service's default PATH is still a bare one.
+        let systemd = joined(&[
+            "/usr/local/sbin",
+            "/usr/local/bin",
+            "/usr/sbin",
+            "/usr/bin",
+            "/sbin",
+            "/bin",
+        ]);
+        let paths = child_path_entries(
+            Platform::Unix,
+            Vec::new(),
+            Some(&systemd),
+            Some(&user),
+            Vec::new(),
+        );
+        assert_eq!(paths[0], PathBuf::from("/opt/homebrew/bin"));
     }
 
     #[test]

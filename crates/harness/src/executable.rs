@@ -680,6 +680,39 @@ fn is_runnable_candidate(path: &Path, platform: Platform) -> bool {
     path.is_file()
 }
 
+/// Directories of a bare system PATH: launchd's for a Dock/Finder launch,
+/// systemd's default for a service, and macOS's path_helper additions.
+const SYSTEM_PATH_DIRS: &[&str] = &[
+    "/usr/local/sbin",
+    "/usr/local/bin",
+    "/usr/sbin",
+    "/usr/bin",
+    "/sbin",
+    "/bin",
+    "/snap/bin",
+    "/usr/games",
+    "/usr/local/games",
+    "/System/Cryptexes/App/usr/bin",
+    "/Library/Apple/usr/bin",
+];
+
+/// Whether a Unix process PATH is only the system's: what a GUI launch or a
+/// service without its own PATH inherits. Only then does the login shell's
+/// PATH (the user's Homebrew, nvm, …) go first; a PATH the user or a unit
+/// set up — a venv, nix, direnv, nvm in the launching terminal — keeps
+/// precedence, for the child's PATH and for resolving the agent binary alike.
+pub(crate) fn is_bare_system_path(path: Option<&OsStr>) -> bool {
+    path.is_none_or(|path| {
+        std::env::split_paths(path).all(|dir| {
+            dir.as_os_str().is_empty()
+                || SYSTEM_PATH_DIRS
+                    .iter()
+                    .any(|system| dir == Path::new(system))
+                || dir.starts_with("/var/run/com.apple.security.cryptexd")
+        })
+    })
+}
+
 pub(crate) fn find_on_paths_with(
     exe: &str,
     extra: Vec<PathBuf>,
@@ -707,10 +740,16 @@ pub(crate) fn find_on_paths_matching_with(
             .flat_map(variants)
             .collect::<Vec<_>>()
     };
-    let mut candidates = env("PATH").map(from_path).unwrap_or_default();
-    if let Some(shell_path) = login_shell_path {
-        candidates.extend(from_path(shell_path));
-    }
+    let own_path = env("PATH");
+    let login_first = platform == Platform::Unix && is_bare_system_path(own_path.as_deref());
+    let own = own_path.map(from_path).unwrap_or_default();
+    let shell = login_shell_path.map(from_path).unwrap_or_default();
+    // The same precedence as the child's PATH (see `child_path_entries`).
+    let mut candidates = if login_first {
+        [shell, own].concat()
+    } else {
+        [own, shell].concat()
+    };
     candidates.extend(
         extra
             .into_iter()
@@ -734,6 +773,38 @@ pub(crate) fn find_on_paths_matching_with(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    /// Resolution walks the PATHs in the child PATH's order: the login shell
+    /// first only behind a bare system PATH.
+    #[cfg(unix)]
+    #[test]
+    fn resolution_prefers_a_deliberate_process_path_like_the_child_path() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (venv, brew) = (dir.path().join("venv"), dir.path().join("brew"));
+        for bin in [&venv, &brew] {
+            std::fs::create_dir_all(bin).unwrap();
+            let exe = bin.join("agent");
+            std::fs::write(&exe, "#!/bin/sh\n").unwrap();
+            std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        let shell = Some(brew.clone().into_os_string());
+        let process = std::env::join_paths([venv.as_path(), Path::new("/usr/bin")]).unwrap();
+        let lookup = env(&[("PATH", process)]);
+        assert_eq!(
+            find_on_paths_with("agent", Vec::new(), &lookup, shell.clone(), Platform::Unix),
+            Some(venv.join("agent"))
+        );
+        let bare = env(&[("PATH", OsString::from("/usr/bin:/bin:/usr/sbin:/sbin"))]);
+        assert_eq!(
+            find_on_paths_with("agent", Vec::new(), &bare, shell, Platform::Unix),
+            Some(brew.join("agent"))
+        );
+        assert!(is_bare_system_path(None));
+        assert!(!is_bare_system_path(Some(OsStr::new(
+            "/nix/store/x/bin:/usr/bin"
+        ))));
+    }
 
     #[test]
     fn a_missing_working_directory_is_not_a_missing_binary() {
