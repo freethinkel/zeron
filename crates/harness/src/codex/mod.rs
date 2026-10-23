@@ -5,22 +5,29 @@
 //! VERSION PIN: the app-server API is EXPERIMENTAL (`capabilities.
 //! experimentalApi`); this driver is validated against codex-cli 0.153.4 —
 //! imageGeneration additionally follows the 0.154.0 schema (savedPath only).
-//! Revalidate the method/notification surface when bumping past it.
+//! Revalidate the method/notification surface when bumping past it. A CLI
+//! older than [`MIN_CODEX_VERSION`] is refused up front.
 //!
-//! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`) then
-//!   the `initialized` notification; unknown notification methods tolerated.
-//! - `thread/start` (or `thread/resume` with a fresh-start fallback) →
-//!   `SessionStarted`; `turn/start` carries the prompt, model, effort,
-//!   `sandboxPolicy`, and approval policy.
+//! - `initialize` handshake (clientInfo + `capabilities.experimentalApi`,
+//!   opting out of the high-volume notifications nothing consumes) then the
+//!   `initialized` notification; unknown notification methods tolerated.
+//! - `thread/start` (or `thread/resume`, unarchiving an archived thread; only
+//!   a conversation that is gone falls back to a fresh thread, with a visible
+//!   notice) → `SessionStarted`; `turn/start` carries the prompt, model,
+//!   effort, `sandboxPolicy`, and approval policy.
 //! - Notifications map to [`AgentEvent`]s: agentMessage/reasoning deltas (both
 //!   `delta`/`textDelta` spellings), item lifecycles → typed ToolCall/ToolResult,
 //!   `thread/tokenUsage/updated` → Usage, turn/completed|failed|aborted → Done.
+//!   An `error` Codex will retry is progress, not an error; a final one is
+//!   reported once, by the turn's Done.
 //! - Approvals + sandbox: yolo mode. The wire policy is always `"never"` and
 //!   the sandbox is forced to `danger-full-access` — parity with the Claude
 //!   adapter's auto-approve-everything (unattended runs). Stray
-//!   `item/commandExecution/requestApproval` +
-//!   `item/fileChange/requestApproval` still round-trip through
-//!   [`RunControls::request_input`] as a synthesized yes/no question.
+//!   `item/commandExecution/requestApproval`,
+//!   `item/fileChange/requestApproval` and `item/permissions/requestApproval`
+//!   still round-trip through [`RunControls::request_input`] as a synthesized
+//!   yes/no question. MCP elicitations (sent whatever the policy) are asked
+//!   when they are a flat form and declined otherwise.
 //! - Subagents are full child app-server threads. Parent spawn items establish
 //!   their stable ownership; content arriving before the spawn is buffered.
 //!   A registered child's notifications route through an EXPLICIT table
@@ -45,6 +52,7 @@
 //!   unresponsive; the stream always ends with `Done { status: Interrupted }`.
 
 pub(crate) mod catalog;
+mod elicitation;
 mod normalize;
 pub mod npm_repair;
 pub mod realtime;
@@ -72,7 +80,7 @@ use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
 use normalize::{
     ChildRoute, Phase, ReasoningStream, delta_text, item_id, item_type, notification_thread_id,
-    route_child_notification, turn_error_message, turn_id, usage_event,
+    route_child_notification, settle_turn_error, turn_error_message, turn_id, usage_event,
 };
 
 /// Locate the device's installed Codex CLI: `CODEX_EXECUTABLE`, then our own
@@ -767,6 +775,16 @@ impl CodexHarness {
                 .canonicalize()
                 .map_err(HarnessError::Io)?,
         );
+        // Cached per binary; a fixed test executable is never version-probed.
+        if self.executable.is_none() {
+            let probe = exe.clone();
+            let version =
+                tokio::task::spawn_blocking(move || crate::executable::binary_version(&probe))
+                    .await
+                    .ok()
+                    .flatten();
+            check_codex_version(version.as_ref())?;
+        }
         // Yolo mode: danger-full-access + approvalPolicy "never" (set below) —
         // codex's --dangerously-bypass-approvals-and-sandbox equivalent.
         // Parity with the Claude adapter, which auto-approves every
@@ -854,6 +872,8 @@ fn spawn_app_server(exe: &Path, request: &RunRequest) -> Result<AppServer, Harne
                 tracing::debug!(target: "zeron_harness::codex", "stderr: {line}");
                 tail.push(&line);
             }
+            // The tail is complete: a crash report need not wait it out.
+            tail.close();
         });
     }
     let (client, incoming) = RpcClient::new(stdin, stdout);
@@ -873,6 +893,118 @@ const STARTUP_RETRY_DELAYS: [Duration; 3] = [
     Duration::from_secs(3),
     Duration::from_secs(8),
 ];
+
+/// High-volume notifications nothing here consumes: the turn's running diff
+/// and every command's / patch's output stream. Opting out at `initialize`
+/// spares the wire (and the reader) from parsing them only to drop them.
+const OPTED_OUT_NOTIFICATIONS: &[&str] = &[
+    "turn/diff/updated",
+    "item/commandExecution/outputDelta",
+    "item/fileChange/outputDelta",
+];
+
+/// The oldest Codex CLI whose app-server speaks the wire this driver maps:
+/// nested `error` notifications, `turn/steer`, child-thread routing (the
+/// live captures under `tests/fixtures/codex` start at 0.146.1). An older
+/// CLI fails confusingly mid-run instead of saying it needs an update.
+const MIN_CODEX_VERSION: semver::Version = semver::Version::new(0, 146, 0);
+
+/// `Err` when `version` is known and older than [`MIN_CODEX_VERSION`]; an
+/// unknown version (a wrapper, a dev build) is given the benefit of the doubt.
+fn check_codex_version(version: Option<&semver::Version>) -> Result<(), HarnessError> {
+    match version {
+        Some(version) if *version < MIN_CODEX_VERSION => Err(HarnessError::Protocol(format!(
+            "Codex CLI {version} is too old; update it to {MIN_CODEX_VERSION} or newer \
+             (npm install -g @openai/codex@latest)"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+fn initialize_params(opt_out: bool) -> Value {
+    let mut capabilities = json!({ "experimentalApi": true });
+    if opt_out {
+        capabilities["optOutNotificationMethods"] = json!(OPTED_OUT_NOTIFICATIONS);
+    }
+    json!({
+        "clientInfo": {
+            "name": "zeron-native",
+            "title": "Zeron",
+            "version": env!("CARGO_PKG_VERSION"),
+        },
+        "capabilities": capabilities,
+    })
+}
+
+/// A setup request's failure as display text. When the app-server died
+/// under it, "exited before responding" says nothing: report its exit
+/// status and last stderr lines instead.
+async fn setup_failure(
+    error: HarnessError,
+    client: &RpcClient,
+    child: &mut Child,
+    stderr_tail: &crate::StderrTail,
+) -> String {
+    // Only a lost answer: a refusal that arrived before the exit says more.
+    if !client.is_closed() || !transport_lost(&error) {
+        return error.to_string();
+    }
+    stderr_tail.wait_closed().await;
+    let status = match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
+        Ok(Ok(status)) => Some(status),
+        _ => child.try_wait().ok().flatten(),
+    };
+    crate::crash_message("codex app-server", status, stderr_tail)
+}
+
+/// The request never got an answer: the app-server is gone (the wire's
+/// own errors for that, see [`RpcClient::request`]).
+fn transport_lost(error: &HarnessError) -> bool {
+    matches!(error, HarnessError::Protocol(message)
+        if message.ends_with("app-server exited before responding")
+            || message.ends_with("app-server stdin closed"))
+}
+
+/// Whether a `thread/resume` failure means the conversation is gone for
+/// good (no rollout on this machine, a thread id Codex never issued), so a
+/// fresh thread is the only way forward. Anything else — a dead process, a
+/// config error — would fail a fresh start too, or lose history needlessly.
+fn resume_unrecoverable(error: &HarnessError) -> bool {
+    let HarnessError::Protocol(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    !transport_lost(error)
+        && [
+            "no rollout",
+            "not found",
+            "invalid session id",
+            "invalid thread id",
+        ]
+        .iter()
+        .any(|needle| message.contains(needle))
+}
+
+/// `thread/resume`, unarchiving the thread first when Codex reports it
+/// archived (the CLI's own archive command, or another client's).
+async fn resume_thread(client: &RpcClient, params: Value) -> Result<Value, HarnessError> {
+    match client.request("thread/resume", params.clone()).await {
+        Err(HarnessError::Protocol(message)) if message.contains("is archived") => {
+            tracing::info!(
+                target: "zeron_harness::codex",
+                "thread/resume: thread archived; unarchiving it"
+            );
+            client
+                .request(
+                    "thread/unarchive",
+                    json!({ "threadId": params["threadId"] }),
+                )
+                .await?;
+            client.request("thread/resume", params).await
+        }
+        other => other,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Session
@@ -1165,18 +1297,9 @@ async fn run_session(session: Session) {
 
     // ---- handshake (interruptible; relaunches a process that died first) ---
     let mut attempt = 0;
+    let mut opt_out = true;
     loop {
-        let handshake = client.request(
-            "initialize",
-            json!({
-                "clientInfo": {
-                    "name": "zeron-native",
-                    "title": "Zeron",
-                    "version": env!("CARGO_PKG_VERSION"),
-                },
-                "capabilities": { "experimentalApi": true },
-            }),
-        );
+        let handshake = client.request("initialize", initialize_params(opt_out));
         let failed = tokio::select! {
             res = handshake => match res {
                 Ok(_) => break,
@@ -1198,6 +1321,16 @@ async fn run_session(session: Session) {
         // Only a process that is gone gets another launch: an answer that
         // refuses (bad config, unsupported version) would refuse again.
         let exited = client.is_closed();
+        // An app-server that predates notification opt-outs may reject the
+        // capability outright; the opt-out is an optimization, so ask again
+        // without it.
+        if !exited && std::mem::take(&mut opt_out) {
+            tracing::debug!(
+                target: "zeron_harness::codex",
+                "initialize refused ({failed}); retrying without notification opt-outs"
+            );
+            continue;
+        }
         if exited && attempt < STARTUP_RETRY_DELAYS.len() {
             let status = child.try_wait().ok().flatten();
             tracing::warn!(
@@ -1299,24 +1432,37 @@ async fn run_session(session: Session) {
                 }
             }
         }
+        let mut restore_notice = None;
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
-            match client.request("thread/resume", Value::Object(p)).await {
+            match resume_thread(&client, Value::Object(p)).await {
                 Ok(thread) => thread,
-                // A missing/foreign rollout falls back to a fresh thread.
-                Err(e) => {
+                // A missing/foreign rollout falls back to a fresh thread —
+                // visibly: the reply will not know the earlier conversation.
+                Err(e) if resume_unrecoverable(&e) => {
                     if command_request(&request.prompt, resume)?.is_some() {
                         return Err(e);
                     }
-                    tracing::debug!(
+                    tracing::warn!(
                         target: "zeron_harness::codex",
                         "thread/resume failed (starting fresh): {e}"
                     );
+                    let reason = match &e {
+                        HarnessError::Protocol(message) => message.clone(),
+                        other => other.to_string(),
+                    };
+                    restore_notice = Some(format!(
+                        "Couldn't restore the earlier Codex conversation ({reason}), so this \
+                         reply starts a new one without its context."
+                    ));
                     client
                         .request("thread/start", Value::Object(start_params.clone()))
                         .await?
                 }
+                // A dead process or a refusal a fresh thread would hit too:
+                // fail the run rather than silently dropping its history.
+                Err(e) => return Err(e),
             }
         } else {
             client
@@ -1330,17 +1476,18 @@ async fn run_session(session: Session) {
             cwd: thread["cwd"].as_str().unwrap_or(&request.cwd).to_owned(),
             model_provider: thread["modelProvider"].as_str().map(str::to_owned),
         };
-        Ok::<_, HarnessError>((thread_id, children, voice_context))
+        Ok::<_, HarnessError>((thread_id, children, voice_context, restore_notice))
     };
-    let (thread_id, mut children, voice_context) = tokio::select! {
+    let (thread_id, mut children, voice_context, restore_notice) = tokio::select! {
         res = setup => match res {
             Ok(thread_id) => thread_id,
             Err(e) => {
+                let error = setup_failure(e, &client, &mut child, &stderr_tail).await;
                 let _ = event_tx
                     .send(Ok(AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
-                        error: Some(e.to_string()),
+                        error: Some(error),
                         session_id: None,
                     }))
                     .await;
@@ -1406,6 +1553,12 @@ async fn run_session(session: Session) {
         shutdown_child(&mut child, kill_grace).await;
         return;
     }
+    if let Some(message) = restore_notice
+        && !send(&event_tx, AgentEvent::Error { message }).await
+    {
+        shutdown_child(&mut child, kill_grace).await;
+        return;
+    }
 
     let mut router = TurnRouter::default();
     let _voice_bridge = realtime.map(|controls| {
@@ -1421,11 +1574,12 @@ async fn run_session(session: Session) {
         match start_turn(&client, turn_params(&live, &request.prompt)).await {
             Ok(id) => router.adopt_started(id),
             Err(e) => {
+                let error = setup_failure(e, &client, &mut child, &stderr_tail).await;
                 let _ = event_tx
                     .send(Ok(AgentEvent::Done {
                         status: DoneStatus::Errored,
                         result: None,
-                        error: Some(e.to_string()),
+                        error: Some(error),
                         session_id: Some(thread_id.clone()),
                     }))
                     .await;
@@ -1442,6 +1596,19 @@ async fn run_session(session: Session) {
     let mut reasoning_streams: HashMap<String, ReasoningStream> = HashMap::new();
     // Token usage is held until the turn ends, emitted just before Done.
     let mut pending_usage: Option<AgentEvent> = None;
+    // The turn's last final `error` notification, reported by its end (see
+    // [`settle_turn_error`]): never as an error part AND the Done's error.
+    let mut held_error: Option<String> = None;
+    // The account's rate-limit windows (`account/rateLimits/updated`), for
+    // a limit error's reset time.
+    let mut rate_limits: Option<Value> = None;
+    // Server→client requests answered from their own task (approvals and
+    // questions waiting on a person), bounded.
+    let request_slots = Arc::new(tokio::sync::Semaphore::new(MAX_PENDING_SERVER_REQUESTS));
+    // An interrupted turn's background-terminal query in flight: the turn
+    // and the process ids Codex still runs (`None`: it could not say).
+    let mut prune_query: Option<tokio::sync::oneshot::Receiver<(String, Option<HashSet<String>>)>> =
+        None;
     // Steers whose `turn/steer` lost the turn-completed race; delivered as the
     // next `turn/start` when the expected turn's end notification arrives.
     // Each carries the configuration it was sent with, adopted when its own
@@ -1702,24 +1869,28 @@ async fn run_session(session: Session) {
                         {
                             break 'main;
                         }
-                        let error = turn_error_message(&params).or_else(|| {
-                            (params
-                                .pointer("/turn/status")
-                                .and_then(Value::as_str)
-                                == Some("failed"))
-                            .then(|| "Codex turn failed".to_owned())
-                        });
+                        let (error, notice) =
+                            settle_turn_error(&params, held_error.take(), rate_limits.as_ref());
                         let status = if interrupted || stopping {
                             DoneStatus::Interrupted
                         } else if error.is_some() {
                             DoneStatus::Errored
+                        } else if params.pointer("/turn/status").and_then(Value::as_str)
+                            == Some("interrupted")
+                        {
+                            // Interrupted by someone else (another client of the
+                            // thread, Codex itself): still not a finished answer.
+                            DoneStatus::Interrupted
                         } else {
                             DoneStatus::Completed
                         };
-                        if status == DoneStatus::Interrupted
-                            || params.pointer("/turn/status").and_then(Value::as_str) == Some("interrupted")
-                        {
+                        if status == DoneStatus::Interrupted {
                             prune_at = Some((tokio::time::Instant::now() + COMMAND_EXIT_GRACE, id.clone()));
+                        }
+                        if let Some(message) = notice.filter(|_| status == DoneStatus::Completed)
+                            && !send(&event_tx, AgentEvent::Error { message }).await
+                        {
+                            break 'main;
                         }
                         stopping = false;
                         done_current = true;
@@ -1775,6 +1946,7 @@ async fn run_session(session: Session) {
                         router.note_completed(&id);
                         stop_when_announced = false;
                         accepted_steers.clear();
+                        let held = held_error.take();
                         if let Some(usage) = pending_usage.take()
                             && !send(&event_tx, usage).await
                         {
@@ -1806,7 +1978,8 @@ async fn run_session(session: Session) {
                                 },
                                 result: None,
                                 error: Some(
-                                    turn_error_message(&params)
+                                    turn_error_message(&params, rate_limits.as_ref())
+                                        .or(held)
                                         .unwrap_or_else(|| "Codex turn failed".into()),
                                 ),
                                 session_id: Some(thread_id.clone()),
@@ -1825,6 +1998,7 @@ async fn run_session(session: Session) {
                         router.note_completed(&id);
                         stop_when_announced = false;
                         accepted_steers.clear();
+                        held_error = None;
                         done_current = true;
                         prune_at = Some((tokio::time::Instant::now() + COMMAND_EXIT_GRACE, id.clone()));
                         if std::mem::take(&mut stopping) && !interrupted {
@@ -1855,17 +2029,26 @@ async fn run_session(session: Session) {
                     }
 
                     "error" => {
-                        // 0.146.x nests it (`params.error.message`); older
-                        // builds were flat (`params.message`) — accept both.
-                        let message = params
-                            .pointer("/error/message")
-                            .and_then(Value::as_str)
-                            .or_else(|| params.get("message").and_then(Value::as_str))
-                            .unwrap_or("Codex error")
-                            .to_owned();
-                        if !send(&event_tx, AgentEvent::Error { message }).await {
+                        let notice = normalize::error_notice(&params, rate_limits.as_ref());
+                        if notice.will_retry {
+                            // "Reconnecting… 2/5": Codex is on it. Not an
+                            // outcome, so not a permanent error in the
+                            // transcript (nor a sign-in prompt).
+                            tracing::info!(
+                                target: "zeron_harness::codex",
+                                "codex retrying: {}", notice.message
+                            );
+                        } else if !done_current {
+                            // The turn's end reports it (turn/completed
+                            // usually repeats it as `turn.error`).
+                            held_error = Some(notice.message);
+                        } else if !send(&event_tx, AgentEvent::Error { message: notice.message }).await {
                             break 'main;
                         }
+                    }
+
+                    "account/rateLimits/updated" => {
+                        normalize::merge_rate_limits(&mut rate_limits, &params);
                     }
 
                     // thread/status, mcpServer startup, account noise, … —
@@ -1882,6 +2065,7 @@ async fn run_session(session: Session) {
                         &params,
                         request.auto_approve,
                         &request_input,
+                        &request_slots,
                     );
                 }
 
@@ -2037,11 +2221,32 @@ async fn run_session(session: Session) {
                 prune_at.as_ref().map_or_else(tokio::time::Instant::now, |(at, _)| *at)
             ), if prune_at.is_some() => {
                 let (_, stopped) = prune_at.take().expect("guarded by if");
-                open_commands.retain(|_, (pid, started_in)| {
-                    started_in.as_deref() != Some(stopped.as_str())
-                        || pid.as_deref().is_some_and(process_alive)
+                // Ask from a task: the answer may take a moment, and the turn
+                // stream keeps flowing meanwhile.
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let client = client.clone();
+                let thread = thread_id.clone();
+                tokio::spawn(async move {
+                    let _ = tx.send((stopped, background_terminals(&client, &thread).await));
                 });
-                turn.set_background(open_commands.len());
+                prune_query = Some(rx);
+            },
+
+            answer = async { prune_query.as_mut().expect("guarded by if").await }, if prune_query.is_some() => {
+                prune_query = None;
+                if let Ok((stopped, live)) = answer {
+                    open_commands.retain(|item, (pid, started_in)| {
+                        started_in.as_deref() != Some(stopped.as_str())
+                            || match &live {
+                                Some(live) => {
+                                    live.contains(item.as_str())
+                                        || pid.as_deref().is_some_and(|pid| live.contains(pid))
+                                }
+                                None => pid.as_deref().is_some_and(process_alive),
+                            }
+                    });
+                    turn.set_background(open_commands.len());
+                }
             },
 
             _ = event_tx.closed() => break 'main,
@@ -2090,7 +2295,54 @@ async fn run_session(session: Session) {
 /// still running counts as background work.
 const COMMAND_EXIT_GRACE: Duration = Duration::from_secs(3);
 
-/// Whether a process the app-server reported is still running.
+/// Server→client requests answered from their own task at once. A flood
+/// beyond this (a misbehaving MCP server) is refused instead of growing
+/// without bound.
+const MAX_PENDING_SERVER_REQUESTS: usize = 32;
+
+/// The `processId`s and item ids of the commands Codex still runs for
+/// `thread` (`thread/backgroundTerminals/list`, paged). The authority on a
+/// command item's `processId`, which names Codex's own exec session rather
+/// than promising an OS pid. `None` when the app-server can't answer (an
+/// older build without the method).
+async fn background_terminals(client: &RpcClient, thread: &str) -> Option<HashSet<String>> {
+    let mut live = HashSet::new();
+    let mut cursor: Option<String> = None;
+    for _ in 0..100 {
+        let mut params = json!({ "threadId": thread });
+        if let Some(cursor) = &cursor {
+            params["cursor"] = cursor.clone().into();
+        }
+        let page = match tokio::time::timeout(
+            Duration::from_secs(5),
+            client.request("thread/backgroundTerminals/list", params),
+        )
+        .await
+        {
+            Ok(Ok(page)) => page,
+            Ok(Err(e)) => {
+                tracing::debug!(target: "zeron_harness::codex", "background terminals unavailable: {e}");
+                return None;
+            }
+            Err(_) => return None,
+        };
+        for terminal in page["data"].as_array().into_iter().flatten() {
+            for key in ["processId", "itemId"] {
+                if let Some(id) = terminal[key].as_str().filter(|id| !id.is_empty()) {
+                    live.insert(id.to_owned());
+                }
+            }
+        }
+        match page["nextCursor"].as_str().filter(|next| !next.is_empty()) {
+            Some(next) if cursor.as_deref() != Some(next) => cursor = Some(next.to_owned()),
+            _ => return Some(live),
+        }
+    }
+    Some(live)
+}
+
+/// Fallback for an app-server that can't list its terminals: whether the
+/// command's reported process id names a running OS process.
 fn process_alive(pid: &str) -> bool {
     #[cfg(unix)]
     {
@@ -2098,9 +2350,33 @@ fn process_alive(pid: &str) -> bool {
         pid.parse::<i32>()
             .is_ok_and(|pid| pid > 0 && unsafe { libc::kill(pid, 0) } == 0)
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
-        // Unknown: count it gone, which leaves the idle reaper as it was.
+        use windows_sys::Win32::Foundation::{CloseHandle, STILL_ACTIVE};
+        use windows_sys::Win32::System::Threading::{
+            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
+        };
+        let Ok(pid) = pid.parse::<u32>() else {
+            return false;
+        };
+        if pid == 0 {
+            return false;
+        }
+        // SAFETY: a query-only handle, closed before returning; a vanished
+        // pid yields a null handle.
+        unsafe {
+            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+            if handle.is_null() {
+                return false;
+            }
+            let mut code = 0u32;
+            let alive = GetExitCodeProcess(handle, &mut code) != 0 && code == STILL_ACTIVE as u32;
+            CloseHandle(handle);
+            alive
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
         let _ = pid;
         false
     }
@@ -2175,8 +2451,10 @@ type RequestInputFn = Box<
 /// Serve one server→client request. Approval requests round-trip through
 /// `request_input` as a synthesized yes/no question (in a subtask so the
 /// message loop keeps flowing); with `auto_approve` they're accepted outright
-/// (belt to the wire-level `approvalPolicy: "never"`). Anything else is
-/// rejected as unsupported so the server never wedges awaiting a reply.
+/// (belt to the wire-level `approvalPolicy: "never"`). MCP elicitations are
+/// asked or declined. Anything else is rejected as unsupported so the server
+/// never wedges awaiting a reply. At most [`MAX_PENDING_SERVER_REQUESTS`]
+/// wait on a person at once; the rest are refused as overloaded.
 fn handle_server_request(
     client: &RpcClient,
     id: Value,
@@ -2184,7 +2462,19 @@ fn handle_server_request(
     params: &Value,
     auto_approve: bool,
     request_input: &Arc<RequestInputFn>,
+    slots: &Arc<tokio::sync::Semaphore>,
 ) {
+    let slot = || {
+        let permit = Arc::clone(slots).try_acquire_owned().ok();
+        if permit.is_none() {
+            tracing::warn!(
+                target: "zeron_harness::codex",
+                "too many pending server requests; refusing {method}"
+            );
+            client.respond_error(&id, -32000, "client overloaded: too many pending requests");
+        }
+        permit
+    };
     // A tool's user-input request (EXPERIMENTAL, codex 0.146.x) is a CONTENT
     // question, never auto-approvable — route it to the input bridge and
     // answer keyed by question id, `{ answers: { <id>: { answers: [..] } } }`.
@@ -2194,9 +2484,11 @@ fn handle_server_request(
             client.respond(&id, json!({ "answers": {} }));
             return;
         }
+        let Some(permit) = slot() else { return };
         let client = client.clone();
         let request_input = Arc::clone(request_input);
         tokio::spawn(async move {
+            let _permit = permit;
             let asked: Vec<UserInputQuestion> = questions.iter().map(|(_, q)| q.clone()).collect();
             let answers = (request_input)(asked).await.unwrap_or_default();
             let mut by_id = serde_json::Map::new();
@@ -2212,27 +2504,65 @@ fn handle_server_request(
         });
         return;
     }
-    let is_approval = matches!(
-        method,
-        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval"
-    );
-    if !is_approval {
-        tracing::debug!(
-            target: "zeron_harness::codex",
-            "unhandled server request: {method}"
-        );
-        client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
+    // MCP servers elicit regardless of the approval policy. A form the input
+    // bridge can ask is asked; anything else is declined — a reply the
+    // server handles, where an error failed its tool call.
+    if method == "mcpServer/elicitation/request" {
+        let Some(form) = elicitation::form(params) else {
+            let mode = params["mode"].as_str().unwrap_or_default();
+            tracing::info!(
+                target: "zeron_harness::codex",
+                mode, "declining an MCP elicitation Zeron can't ask"
+            );
+            client.respond(&id, elicitation::decline());
+            return;
+        };
+        let Some(permit) = slot() else { return };
+        let client = client.clone();
+        let request_input = Arc::clone(request_input);
+        tokio::spawn(async move {
+            let _permit = permit;
+            let answers = (request_input)(form.questions.clone())
+                .await
+                .unwrap_or_default();
+            client.respond(&id, form.response(&answers));
+        });
         return;
     }
+    // Each approval's own accept / decline reply.
+    let reply: fn(&Value, bool) -> Value = match method {
+        "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
+            |_, accept| json!({ "decision": if accept { "accept" } else { "decline" } })
+        }
+        // Granting means granting what was asked, for this turn; an empty
+        // grant is the refusal.
+        "item/permissions/requestApproval" => |params, accept| {
+            json!({
+                "permissions": if accept { params["permissions"].clone() } else { json!({}) },
+                "scope": "turn",
+            })
+        },
+        _ => {
+            tracing::debug!(
+                target: "zeron_harness::codex",
+                "unhandled server request: {method}"
+            );
+            client.respond_error(&id, -32601, &format!("unsupported method: {method}"));
+            return;
+        }
+    };
     if auto_approve {
-        client.respond(&id, json!({ "decision": "accept" }));
+        client.respond(&id, reply(params, true));
         return;
     }
 
+    let Some(permit) = slot() else { return };
     let question = approval_question(method, params);
+    let params = params.clone();
     let client = client.clone();
     let request_input = Arc::clone(request_input);
     tokio::spawn(async move {
+        let _permit = permit;
         // The engine's input bridge owns the `InputRequested`/`InputResolved`
         // lifecycle (it mints the request id the resolver is parked under);
         // emitting our own copy here doubled the doc's input part with an id
@@ -2246,10 +2576,7 @@ fn handle_server_request(
         let accept = answers.iter().any(|a| {
             a.question_id == question.id && a.labels.iter().any(|l| l.eq_ignore_ascii_case("yes"))
         });
-        client.respond(
-            &id,
-            json!({ "decision": if accept { "accept" } else { "decline" } }),
-        );
+        client.respond(&id, reply(&params, accept));
     });
 }
 
@@ -2333,6 +2660,46 @@ fn approval_question(method: &str, params: &Value) -> UserInputQuestion {
                 format!("Codex wants to run `{command}`. Allow it?")
             },
         )
+    } else if method.contains("permissions") {
+        let permissions = &params["permissions"];
+        let mut asks = Vec::new();
+        if permissions.pointer("/network/enabled") == Some(&Value::Bool(true)) {
+            asks.push("network access".to_owned());
+        }
+        let fs = &permissions["fileSystem"];
+        for (key, access) in [("write", "write"), ("read", "read")] {
+            let paths: Vec<&str> = fs[key]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if !paths.is_empty() {
+                asks.push(format!("{access} access to {}", paths.join(", ")));
+            }
+        }
+        for entry in fs["entries"].as_array().into_iter().flatten() {
+            if let (Some(access), Some(path)) = (
+                entry["access"].as_str().filter(|a| *a != "deny"),
+                entry.pointer("/path/path").and_then(Value::as_str),
+            ) {
+                asks.push(format!("{access} access to {path}"));
+            }
+        }
+        let what = if asks.is_empty() {
+            "additional permissions".to_owned()
+        } else {
+            asks.join("; ")
+        };
+        let why = params["reason"]
+            .as_str()
+            .filter(|r| !r.is_empty())
+            .map(|r| format!(" ({r})"))
+            .unwrap_or_default();
+        (
+            "Approve permissions".to_owned(),
+            format!("Codex wants {what}{why}. Allow it?"),
+        )
     } else {
         let paths: Vec<&str> = params
             .get("changes")
@@ -2411,6 +2778,60 @@ mod tests {
             &json!({"command": ["git", "push", "--force"]}),
         );
         assert!(q.question.contains("git push --force"));
+
+        let q = approval_question(
+            "item/permissions/requestApproval",
+            &json!({"reason": "install deps", "permissions": {
+                "network": {"enabled": true},
+                "fileSystem": {"write": ["/repo/.cache"], "entries": [
+                    {"access": "read", "path": {"type": "path", "path": "/etc/hosts"}},
+                    {"access": "deny", "path": {"type": "path", "path": "/secret"}}
+                ]}
+            }}),
+        );
+        assert_eq!(q.header, "Approve permissions");
+        assert_eq!(
+            q.question,
+            "Codex wants network access; write access to /repo/.cache; read access to /etc/hosts (install deps). Allow it?"
+        );
+    }
+
+    #[test]
+    fn only_a_known_old_cli_is_turned_away() {
+        assert!(check_codex_version(None).is_ok());
+        assert!(check_codex_version(Some(&semver::Version::new(0, 164, 0))).is_ok());
+        assert!(check_codex_version(Some(&MIN_CODEX_VERSION)).is_ok());
+        let err = check_codex_version(Some(&semver::Version::new(0, 120, 3)))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("Codex CLI 0.120.3 is too old") && err.contains("0.146.0"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn only_a_missing_conversation_starts_fresh() {
+        let protocol = |m: &str| HarnessError::Protocol(m.into());
+        for gone in [
+            "thread/resume: no rollout found for thread id 019a0000-0000-7000-8000-000000000000",
+            "thread/resume: thread not found: abc",
+            "thread/resume: invalid session id: invalid character: expected an optional prefix of `urn:uuid:`",
+        ] {
+            assert!(resume_unrecoverable(&protocol(gone)), "{gone}");
+        }
+        for keep in [
+            "thread/resume: app-server exited before responding",
+            "thread/resume: app-server stdin closed",
+            "thread/resume: failed to load configuration",
+            "thread/resume: session x is archived. Run `codex unarchive x` to unarchive it first.",
+        ] {
+            assert!(!resume_unrecoverable(&protocol(keep)), "{keep}");
+        }
+        assert!(transport_lost(&protocol(
+            "thread/start: app-server exited before responding"
+        )));
+        assert!(!transport_lost(&protocol("thread/start: bad request")));
     }
 
     #[test]
