@@ -4513,14 +4513,19 @@ async fn drive_run(
 
         // A turn the engine's own shutdown cut off says so in its entry, and
         // is marked here for the next boot to pick back up (see
-        // `SessionsEngine::shutdown`).
+        // `SessionsEngine::shutdown`). A harness whose teardown surfaced an
+        // error instead (a broken pipe as its process went) was cut off all
+        // the same.
         let event = match event {
             AgentEvent::Done {
-                status: DoneStatus::Interrupted,
+                status: status @ (DoneStatus::Interrupted | DoneStatus::Errored),
                 result,
-                error: None,
+                error,
                 session_id,
             } if interrupted && turn_was_active && inner.mark_shutdown_cut(&chat_id, &run_id) => {
+                if let Some(error) = error.filter(|_| status == DoneStatus::Errored) {
+                    tracing::info!(chat = %chat_id, %error, "a turn the shutdown cut off ended with an error");
+                }
                 AgentEvent::Done {
                     status: DoneStatus::Interrupted,
                     result,

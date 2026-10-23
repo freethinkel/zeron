@@ -193,6 +193,8 @@ enum OnInterrupt {
     Finish,
     /// Nothing: the engine waits out its grace period.
     Ignore,
+    /// Its teardown surfaces an error: an errored `Done`.
+    Fail,
 }
 
 #[async_trait]
@@ -241,6 +243,14 @@ impl Harness for HoldingHarness {
                     }));
                 }
                 OnInterrupt::Ignore => std::future::pending::<()>().await,
+                OnInterrupt::Fail => {
+                    let _ = tx.send(Ok(AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some("stdin closed: Broken pipe (os error 32)".into()),
+                        session_id: Some("hs-held".into()),
+                    }));
+                }
             }
         });
         Ok(futures::stream::unfold(
@@ -624,6 +634,38 @@ async fn hold_a_turn_in(core: EngineCore, ask: bool) -> EngineCore {
     )
     .await;
     core
+}
+
+/// A harness whose teardown reports an error (its pipe broke as the engine
+/// shut down) was cut off by the shutdown like any other: picked back up.
+#[tokio::test]
+async fn a_turn_whose_teardown_errors_during_shutdown_is_picked_back_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let core = assemble(
+        &dir,
+        HoldingHarness {
+            ask: false,
+            on_interrupt: OnInterrupt::Fail,
+        },
+    );
+    let core = hold_a_turn_in(core, false).await;
+    core.shutdown().await;
+    drop(core);
+
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+    wait_for(
+        || !requests.lock().unwrap().is_empty(),
+        "the cut-off turn to be picked back up",
+    )
+    .await;
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 1, "{log:#?}");
+        assert!(log[0].prompt.contains("Continue where you left off"));
+    }
+    core.shutdown().await;
 }
 
 #[tokio::test]
