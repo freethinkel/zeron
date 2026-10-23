@@ -3258,3 +3258,61 @@ http.createServer((req, res) => {
     assert_eq!(error.as_deref(), Some(message.as_str()));
     drop(steer_tx);
 }
+
+/// The losers of a first-start migration race, as 1.18.21 prints them: the
+/// statement rides the lines after "Failed query:". Other failed queries,
+/// and DDL outside one, are not transient.
+#[test]
+fn a_lost_migration_race_is_transient() {
+    let raced = "\x1b[91m\x1b[1mError: \x1b[0mUnexpected error\n\nFailed query: \n        CREATE TABLE `workspace` (\n          `id` text PRIMARY KEY\n        );\n      \nparams: ";
+    let mut race = MigrationRace::default();
+    assert!(raced.lines().any(|line| race.feed(line)));
+    let mut race = MigrationRace::default();
+    assert!(
+        race.feed("Failed query: CREATE INDEX `session_project_idx` ON `session` (`project_id`);")
+    );
+    for unrelated in [
+        "Failed query: \n  INSERT INTO `session` VALUES (?)\nparams: 1",
+        "Failed query: \nparams: \nCREATE TABLE `x` (",
+        "CREATE TABLE `x` (",
+        "Error: Unexpected error",
+    ] {
+        let mut race = MigrationRace::default();
+        assert!(
+            !unrelated.lines().any(|line| race.feed(line)),
+            "{unrelated}"
+        );
+    }
+}
+
+/// A server that lost the migration race is relaunched, not reported.
+#[cfg(unix)]
+#[tokio::test]
+async fn startup_retries_a_lost_migration_race() {
+    use std::os::unix::fs::PermissionsExt;
+    let fixture = tempfile::tempdir().unwrap();
+    let exe = fixture.path().join("opencode");
+    let script = r#"#!/usr/bin/env node
+const fs = require('node:fs');
+const http = require('node:http');
+if (process.argv.includes('--version')) { console.log('1.18.21'); process.exit(0); }
+const raced = require('node:path').join(__dirname, 'raced');
+if (!fs.existsSync(raced)) {
+  fs.writeFileSync(raced, '');
+  console.error('Error: Unexpected error\n\nFailed query: \n        CREATE TABLE `workspace` (\n          `id` text PRIMARY KEY\n        );\n      \nparams: ');
+  process.exit(1);
+}
+const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
+http.createServer((req, res) => {
+  res.setHeader('content-type', 'application/json');
+  res.end(JSON.stringify({version: '1.18.21'}));
+}).listen(port, '127.0.0.1', () => console.log(`opencode server listening on http://127.0.0.1:${port}`));
+"#;
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut server = Server::spawn(&exe, fixture.path().to_str(), Duration::from_secs(5), None)
+        .await
+        .unwrap();
+    server.shutdown(Duration::from_millis(100)).await;
+    assert!(fixture.path().join("raced").exists());
+}

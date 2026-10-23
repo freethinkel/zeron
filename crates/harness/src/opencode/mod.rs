@@ -240,7 +240,8 @@ fn variant_to_level(id: &str) -> Option<ReasoningLevel> {
 }
 
 /// Startup retries for a server that exited on a transient fault (a locked
-/// database, a port claimed between our release and its bind), backing off
+/// database, a lost migration race, a port claimed between our release and
+/// its bind), backing off
 /// linearly from [`SPAWN_RETRY_DELAY`].
 const SPAWN_RETRIES: u32 = 4;
 const SPAWN_RETRY_DELAY: Duration = Duration::from_millis(250);
@@ -259,6 +260,37 @@ enum SpawnFailure {
 fn is_database_locked(line: &str) -> bool {
     let line = line.to_ascii_lowercase();
     line.contains("database is locked") || line.contains("sqlite_busy")
+}
+
+/// A schema migration that lost a race with another process's: concurrent
+/// first starts on a fresh database each run the migration DDL, and the
+/// losers exit with "Unexpected error" / "Failed query:", the statement on
+/// the lines after it (observed live, 1.18.21: 3-5 of 6 at once). A relaunch
+/// finds the schema in place. Fed line by line.
+#[derive(Default)]
+struct MigrationRace {
+    /// The last non-blank line was a bare "Failed query:".
+    after_failed_query: bool,
+}
+
+impl MigrationRace {
+    fn feed(&mut self, line: &str) -> bool {
+        let line = line.trim().to_ascii_lowercase();
+        let is_ddl = |sql: &str| {
+            ["create ", "alter ", "drop "]
+                .iter()
+                .any(|verb| sql.starts_with(verb))
+        };
+        if let Some((_, sql)) = line.split_once("failed query:") {
+            let sql = sql.trim();
+            self.after_failed_query = sql.is_empty();
+            return is_ddl(sql);
+        }
+        if line.is_empty() {
+            return false;
+        }
+        std::mem::take(&mut self.after_failed_query) && is_ddl(&line)
+    }
 }
 
 /// The port we picked was claimed before the server bound it.
@@ -711,9 +743,10 @@ impl Server {
     /// Every opencode process shares one SQLite database; a server booting
     /// while another migrates or checkpoints it can exit with "database is
     /// locked" (more often on Windows, whose file locks are mandatory and
-    /// whose malware scan holds new WAL files). That exit alone is retried,
-    /// and on a fresh port, which also covers the port race inherent in
-    /// handing a released port to the child.
+    /// whose malware scan holds new WAL files), and concurrent first starts
+    /// race each other's schema migration ([`MigrationRace`]). Those exits
+    /// alone are retried, and on a fresh port, which also covers the port
+    /// race inherent in handing a released port to the child.
     async fn spawn_with_env(
         exe: &std::path::Path,
         cwd: Option<&str>,
@@ -836,9 +869,13 @@ impl Server {
             let transient = transient.clone();
             tokio::spawn(async move {
                 let mut lines = crate::lossy_lines::lossy_lines(stderr);
+                let mut migration = MigrationRace::default();
                 while let Ok(Some(line)) = lines.next_line().await {
                     tracing::debug!(target: "zeron_harness::opencode", "stderr: {line}");
-                    if is_database_locked(&line) || is_address_in_use(&line) {
+                    if migration.feed(&line)
+                        || is_database_locked(&line)
+                        || is_address_in_use(&line)
+                    {
                         transient.store(true, std::sync::atomic::Ordering::Release);
                     }
                     tail.push(&line);
