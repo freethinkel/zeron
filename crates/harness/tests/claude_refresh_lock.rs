@@ -5,7 +5,8 @@
 use std::os::unix::fs::PermissionsExt;
 use std::time::Duration;
 use zeron_harness::claude::refresh_lock;
-use zeron_harness::{ClaudeHarness, Harness};
+use zeron_harness::{CancellationToken, ClaudeHarness, Harness, RunControls};
+use zeron_proto::{RunRequest, SandboxLevel};
 
 const FAKE_CLAUDE: &str = r#"#!/bin/sh
 dir="$(dirname "$0")"
@@ -58,4 +59,71 @@ async fn a_probe_is_retired_only_once_no_login_refresh_is_in_flight() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     panic!("probe never retired once the refresh was saved");
+}
+
+/// A run's teardown (here: its consumer hung up) waits out a refresh too,
+/// before the CLI gets EOF or a signal. The run names its config dir in its
+/// own environment, so it shares nothing with the probe test's.
+#[tokio::test]
+async fn a_run_is_torn_down_only_once_no_login_refresh_is_in_flight() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = dir.path().join("run-config");
+    std::fs::create_dir_all(&config).unwrap();
+    let script = dir.path().join("claude");
+    std::fs::write(&script, FAKE_CLAUDE).unwrap();
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let events = dir.path().join("events");
+    let [held, _] = refresh_lock::lock_paths(&config);
+    std::fs::create_dir(&held).unwrap();
+
+    let request = RunRequest {
+        prompt: "hello".into(),
+        harness: None,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: dir.path().display().to_string(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        resume: None,
+        attachments: Vec::new(),
+        worktree: None,
+        mcp: None,
+        env: [(
+            "CLAUDE_SECURESTORAGE_CONFIG_DIR".to_owned(),
+            config.display().to_string(),
+        )]
+        .into(),
+    };
+    let (_steer, steering) = tokio::sync::mpsc::channel(1);
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        steering,
+        interrupt: CancellationToken::new(),
+        request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+        turn: Default::default(),
+    };
+    let stream = ClaudeHarness::new()
+        .with_executable(&script)
+        .run(request, controls)
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    drop(stream);
+
+    tokio::time::sleep(Duration::from_millis(800)).await;
+    assert!(
+        !events.exists(),
+        "run torn down mid-refresh: {:?}",
+        std::fs::read_to_string(&events)
+    );
+    std::fs::remove_dir(&held).unwrap();
+    for _ in 0..100 {
+        if events.exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("run never torn down once the refresh was saved");
 }

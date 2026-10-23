@@ -471,6 +471,7 @@ impl ClaudeHarness {
         }
         let mut child = Child::new(child);
         let (Some(mut stdin), Some(stdout)) = stdio else {
+            refresh_lock::settle(&refresh_lock::config_dir(), refresh_lock::SETTLE_MAX).await;
             child.shutdown(self.kill_grace).await;
             return Err(HarnessError::Protocol("claude child has no stdio".into()));
         };
