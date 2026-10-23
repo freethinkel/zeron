@@ -1056,14 +1056,20 @@ mod tests {
         for path in [&slow, &fast] {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).unwrap();
         }
+        // A budget far past the slow binary's 3s: on a loaded machine the
+        // default one could time it out, which is not what this tests.
+        let budget = std::time::Duration::from_secs(30);
         let slow_callers: Vec<_> = (0..4)
             .map(|_| {
                 let slow = slow.clone();
-                std::thread::spawn(move || binary_version(&slow))
+                std::thread::spawn(move || binary_version_with(&slow, budget))
             })
             .collect();
         std::thread::sleep(std::time::Duration::from_millis(200));
-        assert_eq!(binary_version(&fast), Some(semver::Version::new(2, 0, 0)));
+        assert_eq!(
+            binary_version_with(&fast, budget),
+            Some(semver::Version::new(2, 0, 0))
+        );
         assert!(
             slow_callers.iter().all(|caller| !caller.is_finished()),
             "the fast probe waited on the slow one"
