@@ -157,9 +157,10 @@ fn package_version(manifest: &Path) -> Option<String> {
 
 /// The npm prefix the package behind `codex` was installed into globally:
 /// `<prefix>/lib/node_modules/@openai/codex` (Unix) or
-/// `<prefix>/node_modules/@openai/codex` (Windows).
+/// `<prefix>/node_modules/@openai/codex` (Windows), in its plain form: npm
+/// does not take the `\\?\` verbatim paths Windows canonicalizes to.
 fn global_prefix(codex: &Path) -> Option<PathBuf> {
-    let script = std::fs::canonicalize(codex).ok()?;
+    let script = super::plain_executable(std::fs::canonicalize(codex).ok()?);
     let node_modules = script
         .ancestors()
         .find(|dir| dir.file_name().is_some_and(|name| name == "node_modules"))?;
