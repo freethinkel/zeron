@@ -60,8 +60,21 @@ enum LatestSource {
     },
     Command(&'static [&'static str]),
     Hermes,
+    /// Muse's release channel manifest (see [`MUSE_CHANNELS`]).
+    Muse,
     Manual,
 }
+
+/// Muse Code's public release channels; the launcher follows `MUSE_CHANNEL`.
+const MUSE_CHANNELS: &[&str] = &["muse-stable", "muse-canary"];
+/// The launch environment that makes Muse's launcher refresh its own
+/// installation synchronously (it has no `update` subcommand), then report
+/// the version it now runs.
+const MUSE_UPDATE_ENV: &[(&str, &str)] = &[
+    ("MUSE_NO_AUTO_UPDATE", "0"),
+    ("MUSE_SYNC_UPDATE", "1"),
+    ("MUSE_UPDATE_INTERVAL_SECONDS", "0"),
+];
 
 enum UpdateCheck {
     Version(String),
@@ -117,6 +130,8 @@ enum UpdatePlan {
     },
     AntigravityArchive,
     CodexStandalone(CodexStandaloneInstall),
+    /// Muse's official launcher, refreshed through its update environment.
+    MuseLauncher(PathBuf),
     Homebrew(HomebrewPackage),
     /// An npm-packaged CLI, updated by the package manager that owns it.
     Package {
@@ -145,6 +160,12 @@ impl UpdatePlan {
             UpdatePlan::Command { executable, .. } => {
                 npm_global_prefix(executable).map(|prefix| format!("npm:{}", prefix.display()))
             }
+            UpdatePlan::MuseLauncher(launcher) => Some(format!(
+                "muse:{}",
+                std::fs::canonicalize(launcher)
+                    .unwrap_or_else(|_| launcher.clone())
+                    .display()
+            )),
             UpdatePlan::AntigravityArchive | UpdatePlan::CodexStandalone(_) => None,
         }
     }
@@ -352,6 +373,14 @@ fn provider(id: HarnessId) -> ProviderSpec {
             update_args: None,
             manual_command: "Update the configured Antigravity ACP server",
         },
+        HarnessId::Muse => ProviderSpec {
+            version_args: &["--version"],
+            latest: LatestSource::Muse,
+            // Only the official launcher can refresh itself (see
+            // `is_muse_launcher`); a standalone binary is reinstalled.
+            update_args: None,
+            manual_command: "curl -fsSL https://dev.meta.ai/install.sh | sh",
+        },
         HarnessId::Mock => ProviderSpec {
             version_args: &["--version"],
             latest: LatestSource::Manual,
@@ -404,6 +433,9 @@ fn update_plan(
     }
     if harness == HarnessId::ClaudeCode && claude_package_manager_command(executable).is_some() {
         return Err("update Claude Code with its package manager".into());
+    }
+    if harness == HarnessId::Muse && is_muse_launcher(executable) {
+        return Ok(UpdatePlan::MuseLauncher(executable.to_path_buf()));
     }
     if let Some(args) = provider(harness).update_args {
         return Ok(UpdatePlan::Command {
@@ -1016,6 +1048,7 @@ impl HarnessUpdateCoordinator {
                 .antigravity_acp_latest()
                 .await
                 .map(UpdateCheck::Version),
+            LatestSource::Muse => self.muse_latest().await.map(UpdateCheck::Version),
             LatestSource::Claude => {
                 let channel = if let Some(channel) = claude_cask_channel(&executable) {
                     Some(channel)
@@ -1284,6 +1317,7 @@ impl HarnessUpdateCoordinator {
             LatestSource::Npm(package) => self.npm_latest(package).await,
             LatestSource::Opencode => self.npm_latest(opencode_release_package(installed)).await,
             LatestSource::AntigravityAcp => self.antigravity_acp_latest().await,
+            LatestSource::Muse => self.muse_latest().await,
             LatestSource::Claude
             | LatestSource::Command(_)
             | LatestSource::Hermes
@@ -1532,6 +1566,14 @@ impl HarnessUpdateCoordinator {
                     Err(error) => Err(error),
                 }
             }
+            UpdatePlan::MuseLauncher(launcher) => match self.begin_install(harness, &cancel) {
+                Ok(()) => {
+                    run_command_output_env(&launcher, &["--version"], UPDATE_TIMEOUT, MUSE_UPDATE_ENV)
+                        .await
+                        .map(drop)
+                }
+                Err(error) => Err(error),
+            },
             UpdatePlan::Homebrew(package) => match resolve_brew(&package.brew) {
                 Ok(brew) => {
                     let args = package.upgrade_args();
@@ -1906,6 +1948,33 @@ impl HarnessUpdateCoordinator {
             status.error = None;
         });
         true
+    }
+
+    /// The release Muse's channel (`MUSE_CHANNEL`, default stable) serves.
+    async fn muse_latest(&self) -> Result<String, String> {
+        let channel = std::env::var("MUSE_CHANNEL")
+            .ok()
+            .filter(|channel| !channel.is_empty())
+            .unwrap_or_else(|| "muse-stable".into());
+        if !MUSE_CHANNELS.contains(&channel.as_str()) {
+            return Err(format!("Muse channel {channel} has no public release feed"));
+        }
+        let body: serde_json::Value = self
+            .inner
+            .client
+            .get(format!("https://api.meta.ai/muse-code/channels/{channel}"))
+            .send()
+            .await
+            .and_then(reqwest::Response::error_for_status)
+            .map_err(|error| format!("Muse release lookup failed: {error}"))?
+            .json()
+            .await
+            .map_err(|error| format!("Muse release manifest was invalid: {error}"))?;
+        body.get("version")
+            .and_then(serde_json::Value::as_str)
+            .filter(|version| version_numbers(version).is_some())
+            .map(str::to_owned)
+            .ok_or_else(|| "Muse release manifest names no version".into())
     }
 
     async fn npm_latest(&self, package: &str) -> Result<String, String> {
@@ -2867,12 +2936,39 @@ fn extract_latest_version(text: &str) -> Option<String> {
 fn version_numbers(version: &str) -> Option<Vec<u64>> {
     let version = version.trim().trim_start_matches('v');
     let numeric = version.split(['-', '+']).next()?;
-    let values: Vec<u64> = numeric
+    let mut values: Vec<u64> = numeric
         .split('.')
         .map(str::parse)
         .collect::<Result<_, _>>()
         .ok()?;
+    // Muse numbers its builds of one release `-R<n>[.<m>]`: later builds
+    // are newer, and a bare release is older than any of its builds.
+    if let Some(revision) = version
+        .split_once('-')
+        .and_then(|(_, rest)| rest.split('+').next()?.strip_prefix('R'))
+        && let Ok(parts) = revision
+            .split('.')
+            .map(str::parse)
+            .collect::<Result<Vec<u64>, _>>()
+    {
+        values.resize(values.len().max(3), 0);
+        values.extend(parts);
+    }
     (values.len() >= 2).then_some(values)
+}
+
+/// Muse's official launcher (a small script that downloads and runs the
+/// build for its channel) — the only Muse install that can refresh itself.
+fn is_muse_launcher(path: &Path) -> bool {
+    if cfg!(windows) {
+        return false;
+    }
+    let real = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    std::fs::metadata(&real).is_ok_and(|metadata| metadata.is_file() && metadata.len() <= 128 * 1024)
+        && std::fs::read(&real).is_ok_and(|bytes| {
+            let text = String::from_utf8_lossy(&bytes);
+            text.contains("muse-code/launcher-") && text.contains("MUSE_SYNC_UPDATE")
+        })
 }
 
 fn opencode_release_package(installed: &str) -> &'static str {

@@ -302,6 +302,7 @@ pub(crate) mod executable;
 pub mod install;
 pub(crate) mod jsonrpc;
 pub mod mock;
+pub mod muse;
 mod model_context;
 pub mod opencode;
 pub mod pi;
@@ -520,6 +521,7 @@ pub use claude::ClaudeHarness;
 pub use codex::CodexHarness;
 pub use cursor::CursorHarness;
 pub use opencode::OpencodeHarness;
+pub use muse::MuseHarness;
 pub use pi::PiHarness;
 
 // ---------------------------------------------------------------------------

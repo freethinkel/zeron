@@ -234,6 +234,9 @@ icon_assets![
     // Settings → Billing (drawn to the Solar linear set's 1.5 stroke).
     (WALLET, "wallet"),
     (ANTIGRAVITY_MARK, "antigravity-mark"),
+    // A plain monochrome "M" standing in for Muse Code (no official mark
+    // is published for agent hosts).
+    (MUSE_MARK, "muse-mark"),
 ];
 
 /// Serves both the compact control-icon set and the complete file-identity
