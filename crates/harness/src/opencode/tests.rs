@@ -348,6 +348,7 @@ impl TurnWire {
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_millis(50),
+            bus_timeouts: BusTimeouts::default(),
             known_commands: Some(vec![SlashCommand {
                 name: if native_command_reply.is_some() {
                     "project-review"
@@ -2985,13 +2986,35 @@ async fn stream_bus_counts_only_framed_streams_and_abandons_silent_ones() {
     // must keep counting), and never announced.
     let resp = reqwest::get(format!("{base}/global/event")).await.unwrap();
     let silence = Duration::from_millis(300);
-    assert!(!stream_bus(&tx, resp, Protocol::V1, silence, &mut tools, &mut models).await);
+    let before = tokio::time::Instant::now();
+    let mut last_frame = before;
+    let streamed = stream_bus(
+        &tx,
+        resp,
+        Protocol::V1,
+        silence,
+        &mut last_frame,
+        &mut tools,
+        &mut models,
+    );
+    assert!(!streamed.await);
     assert!(rx.try_recv().is_err());
+    assert_eq!(last_frame, before, "no frame, no stamp");
     // A frame, then silence past the bound: abandoned for a reconnect.
     let resp = reqwest::get(format!("{base}/global/event")).await.unwrap();
     let start = tokio::time::Instant::now();
-    assert!(stream_bus(&tx, resp, Protocol::V1, silence, &mut tools, &mut models).await);
+    let streamed = stream_bus(
+        &tx,
+        resp,
+        Protocol::V1,
+        silence,
+        &mut last_frame,
+        &mut tools,
+        &mut models,
+    );
+    assert!(streamed.await);
     assert!(start.elapsed() < Duration::from_secs(5));
+    assert!(last_frame >= start && last_frame + silence <= tokio::time::Instant::now());
     assert!(matches!(rx.try_recv(), Ok(BusMsg::Connected)));
     assert!(matches!(rx.try_recv(), Ok(BusMsg::Event(_))));
 }
@@ -3521,4 +3544,229 @@ async fn a_crash_between_turns_reports_the_crash_once() {
     assert!(error.contains("idle exploded"), "{error}");
     let rest = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
     assert!(matches!(rest, Ok(None)), "{rest:?}");
+}
+
+/// A 1.x server that serves a run until its prompt lands, then wedges: the
+/// open bus goes quiet and every later connection is accepted (as a stopped
+/// process's would be) but never answered — health checks too, unless
+/// `answer_health`. Also returns the count of bus subscriptions.
+async fn wedging_server(answer_health: bool) -> (String, Arc<std::sync::atomic::AtomicUsize>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let wedged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let subscriptions = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let subscribed = subscriptions.clone();
+    tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let wedged = wedged.clone();
+            let subscribed = subscribed.clone();
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buf = [0; 4096];
+                while !request.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match socket.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => request.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let header = String::from_utf8_lossy(&request);
+                let path = header.split_whitespace().nth(1).unwrap_or_default();
+                let path = path.split('?').next().unwrap_or_default().to_owned();
+                let health = path == "/global/health";
+                if path == "/global/event" {
+                    subscribed.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                }
+                if wedged.load(std::sync::atomic::Ordering::SeqCst) && !(health && answer_health) {
+                    // Held open, never answered.
+                    let _ = socket.read(&mut buf).await;
+                    std::future::pending::<()>().await;
+                }
+                if path == "/global/event" {
+                    let _ = socket
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n: connected\n\n")
+                        .await;
+                    std::future::pending::<()>().await;
+                }
+                let body = match path.as_str() {
+                    "/global/health" => r#"{"healthy":true,"version":"1.18.31"}"#,
+                    "/session" => r#"{"id":"fixture"}"#,
+                    _ => "{}",
+                };
+                if path.ends_with("/prompt_async") {
+                    wedged.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+                let _ = socket
+                    .write_all(
+                        format!(
+                            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                            body.len()
+                        )
+                        .as_bytes(),
+                    )
+                    .await;
+            });
+        }
+    });
+    (base, subscriptions)
+}
+
+/// Run one prompt against `base` with the given bus bounds; returns the
+/// error chip and the Done once it settles.
+async fn wedged_run(base: String, timeouts: BusTimeouts) -> (Option<String>, DoneStatus, String) {
+    let (event_tx, mut events) = mpsc::channel(64);
+    let (_steer_tx, steering) = mpsc::channel(1);
+    let request =
+        json!({"prompt": "first", "cwd": "", "sandbox": "workspace-write", "autoApprove": true});
+    tokio::spawn(run_session(Session {
+        server: Server::attached(base),
+        event_tx,
+        controls: RunControls {
+            realtime: None,
+            execution_lease: None,
+            request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+            steering,
+            interrupt: tokio_util::sync::CancellationToken::new(),
+            turn: Default::default(),
+        },
+        request: serde_json::from_value(request).unwrap(),
+        interrupt_grace: Duration::from_secs(2),
+        kill_grace: Duration::from_millis(50),
+        bus_timeouts: timeouts,
+        known_commands: Some(Vec::new()),
+        initial_native_command_selected: false,
+    }));
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut chip = None;
+        loop {
+            match events.recv().await.unwrap().unwrap() {
+                AgentEvent::Error { message } => chip = Some(message),
+                AgentEvent::Done { status, error, .. } => {
+                    return (chip, status, error.unwrap_or_default());
+                }
+                _ => {}
+            }
+        }
+    })
+    .await
+    .expect("a wedged server must end the turn")
+}
+
+/// A server that stops serving without exiting (stopped, hung) still
+/// accepts connections, so reconnects alone would keep the turn Working
+/// for half an hour. One silence and an unanswered health check end it.
+#[tokio::test]
+async fn a_wedged_server_fails_the_turn_after_one_silence() {
+    let (base, subscriptions) = wedging_server(false).await;
+    let start = tokio::time::Instant::now();
+    let (chip, status, error) = wedged_run(
+        base,
+        BusTimeouts {
+            silence: Duration::from_millis(300),
+            probe: Duration::from_millis(300),
+            wedged: Duration::from_secs(60),
+        },
+    )
+    .await;
+    assert_eq!(status, DoneStatus::Errored);
+    assert!(error.contains("stopped responding"), "{error}");
+    assert!(error.contains("health check"), "{error}");
+    assert_eq!(chip.as_deref(), Some(error.as_str()));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    // Checked on the live stream's silence, before any reconnect.
+    assert_eq!(subscriptions.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+/// A server that still answers health checks but whose bus never frames
+/// again is given up on once the wedge budget passes.
+#[tokio::test]
+async fn a_frameless_bus_fails_the_turn_past_the_wedge_budget() {
+    let (base, _) = wedging_server(true).await;
+    let start = tokio::time::Instant::now();
+    let (_, status, error) = wedged_run(
+        base,
+        BusTimeouts {
+            silence: Duration::from_millis(200),
+            probe: Duration::from_secs(1),
+            wedged: Duration::from_millis(1200),
+        },
+    )
+    .await;
+    assert_eq!(status, DoneStatus::Errored);
+    assert!(error.contains("stopped responding"), "{error}");
+    assert!(error.contains("no event for 1s"), "{error}");
+    assert!(start.elapsed() >= Duration::from_millis(1200));
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+/// The live case: a SIGSTOPped `opencode serve`. The turn fails fast and the
+/// stopped process is torn down with the run.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_stopped_server_process_fails_the_turn_and_is_torn_down() {
+    let fixture = tempfile::tempdir().unwrap();
+    let exe = scripted_opencode(
+        fixture.path(),
+        "res.writeHead(204); res.end(); \
+         require('node:fs').writeFileSync(require('node:path').join(__dirname, 'pid'), String(process.pid)); \
+         setTimeout(() => process.kill(process.pid, 'SIGSTOP'), 50);",
+        "json(true);",
+    );
+    let (steer_tx, steering) = mpsc::channel(1);
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+        steering,
+        interrupt: tokio_util::sync::CancellationToken::new(),
+        turn: Default::default(),
+    };
+    let request: RunRequest = serde_json::from_value(json!({
+        "prompt": "hi", "cwd": fixture.path().to_str().unwrap(),
+        "sandbox": "workspace-write", "autoApprove": true,
+    }))
+    .unwrap();
+    let harness = OpencodeHarness::new()
+        .with_executable(&exe)
+        .with_graces(Duration::from_millis(100), Duration::from_millis(100))
+        .with_bus_timeouts(
+            Duration::from_millis(500),
+            Duration::from_millis(500),
+            Duration::from_secs(60),
+        );
+    let mut stream = harness.run(request, controls).await.unwrap();
+    let start = tokio::time::Instant::now();
+    let events = until_done(&mut stream).await;
+    let Some(AgentEvent::Done { status, error, .. }) = events.last() else {
+        unreachable!()
+    };
+    assert_eq!(*status, DoneStatus::Errored);
+    let error = error.as_deref().unwrap();
+    assert!(error.contains("stopped responding"), "{error}");
+    assert!(
+        start.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        start.elapsed()
+    );
+    // The run ends only once its server is gone.
+    let rest = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+    assert!(matches!(rest, Ok(None)), "{rest:?}");
+    let pid = std::fs::read_to_string(fixture.path().join("pid")).unwrap();
+    let alive = std::process::Command::new("kill")
+        .args(["-0", pid.trim()])
+        .stderr(std::process::Stdio::null())
+        .status()
+        .unwrap()
+        .success();
+    assert!(!alive, "the stopped server {pid} outlived its run");
+    drop(steer_tx);
 }

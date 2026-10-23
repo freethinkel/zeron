@@ -55,7 +55,10 @@
 //! Both wires report busy within milliseconds of accepting a prompt, before
 //! any provider bootstrap, so a slow first turn never trips it (verified
 //! live, 1.18.31 and 2.1.2). A server process that dies is noticed within
-//! [`SERVER_POLL`], and a bus silent past [`BUS_SILENCE`] is reconnected.
+//! [`SERVER_POLL`], and a bus silent past [`BUS_SILENCE`] is reconnected —
+//! unless the server, still alive, fails a health check there
+//! ([`BUS_PROBE_TIMEOUT`]) or the bus stays frameless past
+//! [`BUS_WEDGE_BUDGET`]: then the run errors and the server is shut down.
 
 use std::collections::{HashMap, VecDeque};
 use std::path::PathBuf;
@@ -105,6 +108,39 @@ const BUS_RECONNECT_ATTEMPTS: u32 = 40;
 /// event every 10s (1.14.17 through 1.18.31), 2.x a `: heartbeat` comment
 /// every 15s (2.1.2); both verified live.
 const BUS_SILENCE: Duration = Duration::from_secs(45);
+
+/// A bus silent past [`BUS_SILENCE`] gets the server checked before it is
+/// reconnected: a process that is stopped or hung still accepts loopback
+/// connections (the kernel completes the handshake), so each reconnect
+/// would otherwise wait out another silence, and the reconnect budget only
+/// runs out after half an hour of "Working" (observed live, 1.18.21 and
+/// 2.1.2, against a SIGSTOPped server: the connect succeeds, the request is
+/// never answered). Any HTTP answer to its info route proves it alive;
+/// none within this bound ends the run.
+const BUS_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Longest the bus may go without one frame (heartbeats included) before
+/// the server is presumed wedged even though it still answers health
+/// checks: a few silences' worth of reconnects.
+const BUS_WEDGE_BUDGET: Duration = Duration::from_secs(150);
+
+/// Bus liveness bounds; tests shrink them.
+#[derive(Clone, Copy, Debug)]
+struct BusTimeouts {
+    silence: Duration,
+    probe: Duration,
+    wedged: Duration,
+}
+
+impl Default for BusTimeouts {
+    fn default() -> Self {
+        Self {
+            silence: BUS_SILENCE,
+            probe: BUS_PROBE_TIMEOUT,
+            wedged: BUS_WEDGE_BUDGET,
+        }
+    }
+}
 
 /// How often the run checks that its own server process is still alive. A
 /// crash otherwise surfaces only once the bus exhausts its reconnects, and
@@ -321,6 +357,7 @@ pub struct OpencodeHarness {
     base_url: Option<String>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    bus_timeouts: BusTimeouts,
     startup_timeout: Duration,
     models_cache: crate::catalog::Catalog,
     commands_cache: tokio::sync::OnceCell<Vec<SlashCommand>>,
@@ -336,6 +373,7 @@ impl Default for OpencodeHarness {
             base_url: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            bus_timeouts: BusTimeouts::default(),
             startup_timeout: startup_timeout(),
             models_cache: crate::catalog::Catalog::default(),
             commands_cache: tokio::sync::OnceCell::new(),
@@ -364,6 +402,23 @@ impl OpencodeHarness {
     pub fn with_graces(mut self, interrupt: Duration, kill: Duration) -> Self {
         self.interrupt_grace = interrupt;
         self.kill_grace = kill;
+        self
+    }
+
+    /// Shrink the event-bus liveness bounds (tests): the silence that gets
+    /// the server health-checked, that check's answer bound, and the
+    /// longest the bus may go without a frame.
+    pub fn with_bus_timeouts(
+        mut self,
+        silence: Duration,
+        probe: Duration,
+        wedged: Duration,
+    ) -> Self {
+        self.bus_timeouts = BusTimeouts {
+            silence,
+            probe,
+            wedged,
+        };
         self
     }
 
@@ -580,6 +635,7 @@ impl Harness for OpencodeHarness {
             request,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            bus_timeouts: self.bus_timeouts,
             known_commands: None, // Resolve the live session directory, never a global probe cache.
             initial_native_command_selected,
         }));
@@ -1695,6 +1751,7 @@ struct Session {
     request: RunRequest,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    bus_timeouts: BusTimeouts,
     known_commands: Option<Vec<SlashCommand>>,
     /// True only when the composer supplied a canonical leading command or
     /// provider-backed skill. Raw slash text deliberately stays false.
@@ -1729,6 +1786,10 @@ enum BusMsg {
     /// The stream is gone past the reconnect budget (or the reader saw the
     /// consumer close).
     Disconnected,
+    /// The server is up but no longer serving: the bus went silent and the
+    /// server failed its health check, or no frame came within the wedge
+    /// budget. Carries the run's error.
+    Unresponsive(String),
 }
 
 /// Per-part streaming state (dedup between full-part snapshots and deltas).
@@ -1884,6 +1945,7 @@ async fn run_session(session: Session) {
         request,
         interrupt_grace,
         kill_grace,
+        bus_timeouts,
         known_commands,
         initial_native_command_selected,
     } = session;
@@ -2055,7 +2117,7 @@ async fn run_session(session: Session) {
         server.auth.clone(),
         server.protocol().await,
         bus_tx.clone(),
-        BUS_SILENCE,
+        bus_timeouts,
     ));
 
     // ---- first prompt -----------------------------------------------------
@@ -2333,8 +2395,8 @@ async fn run_session(session: Session) {
     // port. Between turns the Done still carries the crash message, never a
     // later transport error.
     macro_rules! settle_lost_server {
-        ($label:lifetime, $status:expr) => {{
-            let message = crate::crash_message("opencode serve", $status, &server.stderr_tail);
+        ($label:lifetime, message: $message:expr) => {{
+            let message: String = $message;
             if turn.active {
                 let _ = send(
                     &event_tx,
@@ -2362,6 +2424,10 @@ async fn run_session(session: Session) {
             .await;
             done_sent = true;
             break $label;
+        }};
+        ($label:lifetime, $status:expr) => {{
+            let message = crate::crash_message("opencode serve", $status, &server.stderr_tail);
+            settle_lost_server!($label, message: message)
         }};
     }
 
@@ -2785,6 +2851,16 @@ async fn run_session(session: Session) {
                             server.stderr_tail.wait_closed().await;
                         }
                         settle_lost_server!('main, crashed);
+                    }
+                    BusMsg::Unresponsive(message) => {
+                        // A server that died meanwhile reports its crash.
+                        if let Some(status) = server.exited() {
+                            server.stderr_tail.wait_closed().await;
+                            settle_lost_server!('main, Some(status));
+                        }
+                        tracing::warn!(target: "zeron_harness::opencode", "{message}");
+                        // Ending the run tears the server down.
+                        settle_lost_server!('main, message: message);
                     }
                     BusMsg::Event(event) => {
                         if interrupt_requested || stopping {
@@ -5036,19 +5112,35 @@ fn v2_tool_part(data: &Value, id: &str, name: &str, state: &Value) -> Value {
 /// text/event-stream` is sent — observed live, 2.0.3). Reconnects on
 /// transient drops (the server is our own child on loopback); past the
 /// budget the loop learns via [`BusMsg::Disconnected`] and errors the run —
-/// missed frames mean the transcript can no longer be trusted.
+/// missed frames mean the transcript can no longer be trusted. A server
+/// that stops serving without exiting ends it via [`BusMsg::Unresponsive`]
+/// ([`BUS_PROBE_TIMEOUT`], [`BUS_WEDGE_BUDGET`]).
 async fn bus_task(
     base: String,
     auth: Option<String>,
     protocol: Protocol,
     tx: mpsc::Sender<BusMsg>,
-    silence: Duration,
+    timeouts: BusTimeouts,
 ) {
+    let BusTimeouts {
+        silence,
+        probe,
+        wedged,
+    } = timeouts;
     let client = http_client();
     let url = match protocol {
         Protocol::V1 => format!("{base}/global/event"),
         Protocol::V2 => format!("{base}/api/event"),
     };
+    // 2.1.2 answers 404 on `/api/health`; `/api/info` is its live route.
+    let health = match protocol {
+        Protocol::V1 => format!("{base}/global/health"),
+        Protocol::V2 => format!("{base}/api/info"),
+    };
+    // The server just answered its startup and session calls.
+    let mut last_frame = tokio::time::Instant::now();
+    // Attempts in a row that ended in silence.
+    let mut silences: u32 = 0;
     let mut failures: u32 = 0;
     let mut v2_tool_names: HashMap<V2ToolKey, String> = HashMap::new();
     let mut v2_session_models: HashMap<String, V2ModelIdentity> = HashMap::new();
@@ -5064,6 +5156,7 @@ async fn bus_task(
         }
         // A server that accepts the connection but never answers it must
         // not park the bus forever either.
+        let attempt = tokio::time::Instant::now();
         match tokio::time::timeout(silence, req.send()).await {
             Ok(Ok(resp)) if resp.status().is_success() => {
                 let framed = stream_bus(
@@ -5071,6 +5164,7 @@ async fn bus_task(
                     resp,
                     protocol,
                     silence,
+                    &mut last_frame,
                     &mut v2_tool_names,
                     &mut v2_session_models,
                 )
@@ -5090,6 +5184,45 @@ async fn bus_task(
         }
         // (stream_bus sends Connected itself once the first frame lands —
         // an accepted-but-parked boot-window connection must not count.)
+        let quiet = last_frame.elapsed();
+        if quiet < silence {
+            silences = 0;
+        } else {
+            // A stream that framed, then fell silent, is the first silence.
+            silences = if last_frame >= attempt {
+                1
+            } else {
+                silences + 1
+            };
+            // Any answer at all proves the process is serving.
+            let mut check = client.get(&health).timeout(probe);
+            if let Some(auth) = &auth {
+                check = check.header(reqwest::header::AUTHORIZATION, auth.clone());
+            }
+            let unresponsive = if check.send().await.is_err() {
+                Some(format!(
+                    "opencode server stopped responding: no event for {}s, and no answer \
+                     to a health check within {}s",
+                    quiet.as_secs(),
+                    probe.as_secs_f32()
+                ))
+            } else {
+                // Two silences waited out, so a clock that jumped across a
+                // machine sleep (one timer firing late) never trips it.
+                (silences >= 2 && quiet >= wedged).then(|| {
+                    format!(
+                        "opencode server stopped responding: no event for {}s",
+                        quiet.as_secs()
+                    )
+                })
+            };
+            if let Some(message) = unresponsive {
+                let message =
+                    format!("{message}. It was shut down; the next message starts a fresh one");
+                let _ = tx.send(BusMsg::Unresponsive(message)).await;
+                return;
+            }
+        }
         failures += 1;
         if failures > BUS_RECONNECT_ATTEMPTS {
             let _ = tx.send(BusMsg::Disconnected).await;
@@ -5099,14 +5232,15 @@ async fn bus_task(
     }
 }
 
-/// Forward one stream's events; returns whether it delivered a frame. A
-/// stream silent for `silence` (heartbeats included) is abandoned so the
-/// caller reconnects.
+/// Forward one stream's events; returns whether it delivered a frame, and
+/// stamps `last_frame` with each. A stream silent for `silence` (heartbeats
+/// included) is abandoned so the caller reconnects.
 async fn stream_bus(
     tx: &mpsc::Sender<BusMsg>,
     resp: reqwest::Response,
     protocol: Protocol,
     silence: Duration,
+    last_frame: &mut tokio::time::Instant,
     v2_tool_names: &mut HashMap<V2ToolKey, String>,
     v2_session_models: &mut HashMap<String, V2ModelIdentity>,
 ) -> bool {
@@ -5126,7 +5260,11 @@ async fn stream_bus(
                 return announced;
             }
         };
+        let frames = decoder.frames;
         let events = decoder.feed(&bytes);
+        if decoder.frames > frames {
+            *last_frame = tokio::time::Instant::now();
+        }
         if !announced && decoder.frames > 0 {
             announced = true;
             if tx.send(BusMsg::Connected).await.is_err() {
