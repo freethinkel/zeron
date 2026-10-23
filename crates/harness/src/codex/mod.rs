@@ -258,6 +258,7 @@ impl CodexHarness {
             Ok::<Value, HarnessError>(skills)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        client.close_stdin_for_teardown();
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -355,6 +356,7 @@ impl CodexHarness {
             Ok::<Vec<Model>, HarnessError>(models)
         };
         let result = tokio::time::timeout(Duration::from_secs(10), discovery).await;
+        client.close_stdin_for_teardown();
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -1306,6 +1308,7 @@ async fn run_session(session: Session) {
                         session_id: None,
                     }))
                     .await;
+                client.close_stdin_for_teardown();
                 shutdown_child(&mut child, kill_grace).await;
                 return;
             }
@@ -1331,6 +1334,7 @@ async fn run_session(session: Session) {
                 error = %crate::crash_message("codex app-server", status, &stderr_tail),
                 "app-server died before initialize; relaunching"
             );
+            client.close_stdin_for_teardown();
             shutdown_child(&mut child, kill_grace).await;
             tokio::select! {
                 _ = tokio::time::sleep(STARTUP_RETRY_DELAYS[attempt]) => {}
@@ -1390,6 +1394,7 @@ async fn run_session(session: Session) {
                 session_id: None,
             }))
             .await;
+        client.close_stdin_for_teardown();
         shutdown_child(&mut child, kill_grace).await;
         return;
     }
@@ -1483,6 +1488,7 @@ async fn run_session(session: Session) {
                         session_id: None,
                     }))
                     .await;
+                client.close_stdin_for_teardown();
                 shutdown_child(&mut child, kill_grace).await;
                 return;
             }
@@ -1496,6 +1502,7 @@ async fn run_session(session: Session) {
                     session_id: None,
                 }))
                 .await;
+            client.close_stdin_for_teardown();
             shutdown_child(&mut child, kill_grace).await;
             return;
         }
@@ -1542,12 +1549,14 @@ async fn run_session(session: Session) {
     )
     .await
     {
+        client.close_stdin_for_teardown();
         shutdown_child(&mut child, kill_grace).await;
         return;
     }
     if let Some(message) = restore_notice
         && !send(&event_tx, AgentEvent::Error { message }).await
     {
+        client.close_stdin_for_teardown();
         shutdown_child(&mut child, kill_grace).await;
         return;
     }
@@ -1575,6 +1584,7 @@ async fn run_session(session: Session) {
                         session_id: Some(thread_id.clone()),
                     }))
                     .await;
+                client.close_stdin_for_teardown();
                 shutdown_child(&mut child, kill_grace).await;
                 return;
             }
@@ -2277,6 +2287,7 @@ async fn run_session(session: Session) {
         }
     }
 
+    client.close_stdin_for_teardown();
     crate::shutdown_agent(&mut child, torn_down, kill_grace).await;
     if let Some(handle) = escalation {
         handle.abort();

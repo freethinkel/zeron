@@ -232,6 +232,7 @@ impl Process {
     }
     async fn shutdown(&mut self, grace: Duration) {
         self.dialogs.cancel(&self.transport.client);
+        self.transport.close_input_for_teardown();
         self.child.shutdown(grace).await;
     }
 }

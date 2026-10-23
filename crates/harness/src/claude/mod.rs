@@ -534,6 +534,10 @@ impl ClaudeHarness {
                 PROBE_TIMEOUT.as_secs()
             ))),
         };
+        // EOF first (the `discovery` borrow has ended): Windows' teardown
+        // waits for the CLI to exit on it.
+        #[cfg(windows)]
+        drop(stdin);
         child.shutdown(self.kill_grace).await;
         result
     }
@@ -861,6 +865,15 @@ impl Stdin {
     fn line(&mut self, line: String) -> bool {
         self.send(StdinMsg::Line(line))
     }
+
+    /// Before the CLI's teardown: Windows' gives it its grace to exit on
+    /// stdin EOF, which the writer holds off while any sender (a pending
+    /// permission answer's) is alive. Unix teardown signals instead; its
+    /// order is unchanged.
+    fn close_for_teardown(&self) {
+        #[cfg(windows)]
+        let _ = self.tx.send(StdinMsg::Close);
+    }
 }
 
 #[derive(Clone)]
@@ -1088,6 +1101,7 @@ async fn run_session(session: Session) {
             // without starting one. Everything written to it goes to a fresh
             // process; its own init reports the new session id.
             let replay = stdin.replay.take().unwrap_or_default();
+            stdin.close_for_teardown();
             child.shutdown(kill_grace).await;
             let mut fresh = launched.clone();
             fresh.resume = None;
@@ -1543,6 +1557,7 @@ async fn run_session(session: Session) {
 
     // Its whole process group goes with it, and whatever was traced
     // before — on every exit path, not only an interrupt.
+    stdin.close_for_teardown();
     child.shutdown_with(torn_down, kill_grace).await;
     if let Some(handle) = escalation {
         handle.abort();

@@ -1331,6 +1331,7 @@ impl AcpHarness {
             request_draining(&client, &mut incoming, "logout", json!({})).await
         };
         let result = tokio::time::timeout(SIGN_OUT_TIMEOUT, flow).await;
+        client.close_stdin_for_teardown();
         child.shutdown(self.kill_grace).await;
         match result {
             Ok(outcome) => outcome.map(|_| ()),
@@ -1477,6 +1478,7 @@ impl AcpHarness {
             .await
         };
         let result = tokio::time::timeout(SIGN_IN_TIMEOUT, flow).await;
+        client.close_stdin_for_teardown();
         shutdown_child(&mut child, self.kill_grace).await;
         match result {
             Ok(outcome) => outcome.map(|_| ()),
@@ -1850,6 +1852,7 @@ impl AcpHarness {
         let discovery =
             unless_sign_in_prompted(discovery, &sign_in_prompted, self.spec.display_name);
         let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
+        client.close_stdin_for_teardown();
         child.shutdown(self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -1908,6 +1911,7 @@ impl AcpHarness {
             unless_sign_in_prompted(discovery, &sign_in_prompted, self.spec.display_name);
         let result = tokio::time::timeout(self.model_discovery_timeout, discovery).await;
         drain.abort();
+        client.close_stdin_for_teardown();
         child.shutdown(self.kill_grace).await;
         match result {
             Ok(inner) => inner,
@@ -4160,6 +4164,7 @@ async fn run_session(session: Session) {
                             session_id: None,
                         }))
                         .await;
+                    client.close_stdin_for_teardown();
                     child.shutdown(kill_grace).await;
                     return;
                 }
@@ -4209,6 +4214,7 @@ async fn run_session(session: Session) {
                     session_id: None,
                 }))
                 .await;
+            client.close_stdin_for_teardown();
             child.shutdown(kill_grace).await;
             return;
         }
@@ -4228,6 +4234,7 @@ async fn run_session(session: Session) {
     )
     .await
     {
+        client.close_stdin_for_teardown();
         child.shutdown(kill_grace).await;
         return;
     }
@@ -4240,6 +4247,7 @@ async fn run_session(session: Session) {
         )
         .await
     {
+        client.close_stdin_for_teardown();
         child.shutdown(kill_grace).await;
         return;
     }
@@ -5437,6 +5445,7 @@ async fn run_session(session: Session) {
         }
     }
 
+    client.close_stdin_for_teardown();
     child.shutdown(kill_grace).await;
 }
 
