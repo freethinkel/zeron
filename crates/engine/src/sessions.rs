@@ -1796,6 +1796,17 @@ impl SessionsEngine {
                         .store(true, std::sync::atomic::Ordering::Release);
                 }
             }
+        } else {
+            // A sign-out stops every turn, like the user's Stop. Each is
+            // marked before any is terminated: an engine killed partway
+            // through the loop below must not leave the chats it never
+            // reached reading as crashed (and revived at the next sign-in).
+            let live: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
+            for chat_id in live {
+                if self.turn_in_flight(&chat_id) {
+                    self.inner.journal.note_user_stop(&chat_id);
+                }
+            }
         }
         let chats: Vec<String> = lock(&self.inner.runs).keys().cloned().collect();
         for chat_id in chats {

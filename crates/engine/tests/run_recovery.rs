@@ -1317,6 +1317,53 @@ async fn a_revival_yields_to_a_message_sent_while_it_was_on_its_way() {
     core.shutdown().await;
 }
 
+/// A sign-out's shutdown that dies before it reached a turn (killed in its
+/// serial terminate loop) still never revives that turn.
+#[test]
+fn a_sign_out_shutdown_that_dies_midway_revives_nothing() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    {
+        let engine = tokio::runtime::Runtime::new().unwrap();
+        engine.block_on(async {
+            let core = assemble(
+                &dir,
+                HoldingHarness {
+                    ask: false,
+                    on_interrupt: OnInterrupt::Ignore,
+                },
+            );
+            let core = hold_a_turn_in(core, false).await;
+            core.sessions.forgo_revival();
+            let sessions = core.sessions.clone();
+            tokio::spawn(async move { sessions.shutdown().await });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            core.doc_host.flush_all();
+            drop(core);
+        });
+        engine.shutdown_timeout(Duration::from_millis(100));
+    }
+    assert!(
+        journal(&dir)
+            .stale_sessions()
+            .unwrap()
+            .contains(&CHAT.to_string()),
+        "the journal reads like a crash"
+    );
+
+    let engine = tokio::runtime::Runtime::new().unwrap();
+    engine.block_on(async {
+        let requests: RequestLog = Default::default();
+        let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+        settle().await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a sign-out is never undone"
+        );
+        core.shutdown().await;
+    });
+}
+
 #[test]
 fn a_stop_the_engine_dies_before_settling_is_not_revived() {
     let tmp = tempfile::tempdir().unwrap();
