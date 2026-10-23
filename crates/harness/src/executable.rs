@@ -185,6 +185,20 @@ struct VersionCache {
     /// One lock per executable being probed, so concurrent callers for the
     /// same binary share one `--version` while other binaries probe freely.
     probing: std::collections::HashMap<VersionKey, std::sync::Arc<std::sync::Mutex<()>>>,
+    /// Per name, how often [`invalidate_versions`] cleared it: a probe whose
+    /// names were cleared while it ran may have run the replaced wrapper, so
+    /// its answer is not cached.
+    invalidated: std::collections::HashMap<String, u64>,
+}
+
+impl VersionCache {
+    /// A stamp over `names` that changes whenever any of them is invalidated.
+    fn invalidation_stamp<'a>(&self, names: impl IntoIterator<Item = &'a String>) -> u64 {
+        names
+            .into_iter()
+            .map(|name| self.invalidated.get(name).copied().unwrap_or(0))
+            .sum()
+    }
 }
 
 static VERSION_CACHE: std::sync::OnceLock<std::sync::Mutex<VersionCache>> =
@@ -223,7 +237,11 @@ fn version_cache() -> std::sync::MutexGuard<'static, VersionCache> {
 /// Clear all candidates, including canonical paths behind vendor symlinks.
 pub(crate) fn invalidate_versions(names: &[&str]) {
     if VERSION_CACHE.get().is_some() {
-        version_cache()
+        let mut cache = version_cache();
+        for name in names {
+            *cache.invalidated.entry((*name).to_owned()).or_default() += 1;
+        }
+        cache
             .entries
             .retain(|_, entry| !names.iter().any(|name| entry.aliases.contains(*name)));
     }
@@ -267,9 +285,19 @@ fn binary_version_with(path: &Path, timeout: std::time::Duration) -> Option<semv
     // The global lock is released while probing: a slow binary must not
     // stall every other harness's resolution behind it.
     let _probing = slot.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(version) = cached(&mut version_cache()) {
-        return version;
-    }
+    // The names this binary is known by: what an invalidation would match.
+    let (names, stamp) = {
+        let mut cache = version_cache();
+        if let Some(version) = cached(&mut cache) {
+            return version;
+        }
+        let mut names: Vec<String> = vec![alias.clone()];
+        if let Some(entry) = cache.entries.get(&key) {
+            names.extend(entry.aliases.iter().cloned());
+        }
+        let stamp = cache.invalidation_stamp(&names);
+        (names, stamp)
+    };
     let (version, expires) = match probe_version(path, timeout) {
         Probe::Answered(Some(version)) => (Some(version), None),
         Probe::Answered(None) => (None, Some(std::time::Instant::now() + VERSION_FAILURE_TTL)),
@@ -279,6 +307,18 @@ fn binary_version_with(path: &Path, timeout: std::time::Duration) -> Option<semv
         ),
     };
     let mut cache = version_cache();
+    if cache.invalidation_stamp(&names) != stamp {
+        // An install replaced wrappers while this probe ran: its answer may
+        // be the old one's, so the next caller asks again.
+        if cache
+            .probing
+            .get(&key)
+            .is_some_and(|current| std::sync::Arc::ptr_eq(current, &slot))
+        {
+            cache.probing.remove(&key);
+        }
+        return version;
+    }
     let mut aliases: std::collections::HashSet<String> = [alias].into_iter().collect();
     // An inconclusive retry keeps the aliases earlier callers registered.
     if let Some(previous) = cache.entries.get(&key) {
@@ -1033,6 +1073,53 @@ mod tests {
             entry.expires = Some(std::time::Instant::now());
         }
         assert_eq!(binary_version(&path), Some(semver::Version::new(1, 2, 3)));
+    }
+
+    /// An install that replaces a wrapper in place (same metadata) while it
+    /// is being probed: the probe's answer, from the old wrapper, is not
+    /// cached over the invalidation.
+    #[cfg(unix)]
+    #[test]
+    fn a_probe_racing_an_invalidation_does_not_cache_its_answer() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("racing-wrapper");
+        let (calls, go) = (dir.path().join("calls"), dir.path().join("go"));
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\necho x >> '{}'\nwhile [ ! -e '{}' ]; do sleep 0.02; done\necho cli 1.0.0\n",
+                calls.display(),
+                go.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let budget = std::time::Duration::from_secs(30);
+        let probe = {
+            let path = path.clone();
+            std::thread::spawn(move || binary_version_with(&path, budget))
+        };
+        while !calls.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        invalidate_versions(&["racing-wrapper"]);
+        std::fs::write(&go, "").unwrap();
+        assert_eq!(probe.join().unwrap(), Some(semver::Version::new(1, 0, 0)));
+        let canonical = path.canonicalize().unwrap();
+        assert!(
+            !version_cache()
+                .entries
+                .keys()
+                .any(|(p, _, _)| p == &canonical),
+            "the stale answer was cached"
+        );
+        // The next caller probes again.
+        assert_eq!(
+            binary_version_with(&path, budget),
+            Some(semver::Version::new(1, 0, 0))
+        );
+        assert_eq!(std::fs::read_to_string(&calls).unwrap(), "x\nx\n");
     }
 
     /// Concurrent callers for one binary share a probe, and a slow binary
