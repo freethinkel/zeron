@@ -25,7 +25,10 @@ use gpui::{
 
 use zeron_engine::registry::{HarnessDescriptor, descriptor_enabled};
 
-use zeron_proto::{HarnessId, HarnessUpdatePhase, HarnessUpdatePolicy, HarnessUpdateStatus};
+use zeron_proto::{
+    HarnessId, HarnessUpdateFailureKind, HarnessUpdatePhase, HarnessUpdatePolicy,
+    HarnessUpdateStatus,
+};
 
 use zeron_rpc::methods;
 
@@ -125,6 +128,15 @@ pub fn cli_name(harness: HarnessId) -> &'static str {
     }
 }
 
+/// The failure was the update itself (its release is still known, so it can
+/// be retried), not a failed check.
+fn install_failed(status: &HarnessUpdateStatus) -> bool {
+    status
+        .error
+        .as_ref()
+        .is_some_and(|error| error.kind == HarnessUpdateFailureKind::Install)
+}
+
 /// A provider's version line: the installed version, plus only what the
 /// Update button doesn't already say (progress, a failure), all in one muted
 /// tone. Up-to-date providers, checks in flight and providers whose updates
@@ -162,6 +174,7 @@ fn harness_update_label(status: &HarnessUpdateStatus, theme: &Theme) -> (SharedS
         HarnessUpdatePhase::Installing => with("Installing…"),
         HarnessUpdatePhase::Verifying => with("Verifying…"),
         HarnessUpdatePhase::Updated => with("Updated"),
+        HarnessUpdatePhase::Failed if install_failed(status) => with("Update failed"),
         HarnessUpdatePhase::Failed => with("Couldn't check for updates"),
     };
     let color = match status.phase {
@@ -1154,6 +1167,11 @@ impl HarnessesPage {
                             if status.can_apply =>
                         {
                             ("harness-update", "Update", true)
+                        }
+                        HarnessUpdatePhase::Failed
+                            if status.can_apply && install_failed(status) =>
+                        {
+                            ("harness-update", "Retry update", true)
                         }
                         HarnessUpdatePhase::WaitingForIdle
                         | HarnessUpdatePhase::Preparing

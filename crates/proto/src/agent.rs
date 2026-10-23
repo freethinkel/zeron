@@ -128,6 +128,21 @@ pub struct HarnessUpdateFailure {
     pub message: String,
     #[serde(default)]
     pub retryable: bool,
+    /// What failed: looking for a release, or installing one. An engine that
+    /// predates the field only ever reported failed checks.
+    #[serde(default)]
+    pub kind: HarnessUpdateFailureKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum HarnessUpdateFailureKind {
+    /// The version probe or release lookup failed; checking again retries.
+    #[default]
+    Check,
+    /// The updater or its verification failed; the release is still known,
+    /// so the update itself can be retried.
+    Install,
 }
 
 /// One row in the device-local harness-update stream.

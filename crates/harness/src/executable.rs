@@ -173,8 +173,9 @@ type VersionKey = (PathBuf, Option<std::time::SystemTime>, u64);
 struct VersionEntry {
     version: Option<semver::Version>,
     aliases: std::collections::HashSet<String>,
-    /// Set for a probe that could not finish (timeout, transient spawn
-    /// failure): it says nothing about the binary, so it is retried soon.
+    /// Set for anything but a version: a probe that could not finish
+    /// (timeout, transient spawn failure) is retried soon, a definite
+    /// failure a little later; only an answer is kept for the binary's life.
     expires: Option<std::time::Instant>,
 }
 
@@ -199,6 +200,9 @@ const VERSION_PROBE_TIMEOUT: std::time::Duration = if cfg!(windows) {
 
 /// How long an inconclusive probe is trusted before the binary is asked again.
 const INCONCLUSIVE_VERSION_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long a definite failure (non-zero exit, no version in the output) is
+/// trusted: a busy machine or a half-finished update heals.
+const VERSION_FAILURE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
 
 enum Probe {
     /// The binary answered: a version, or a definite failure (non-zero exit,
@@ -225,10 +229,10 @@ pub(crate) fn invalidate_versions(names: &[&str]) {
     }
 }
 
-/// Probe once per executable identity. Answers (including failures) are
-/// cached until the file changes; a probe that timed out is retried after
-/// [`INCONCLUSIVE_VERSION_TTL`], so one cold first exec cannot pin an older
-/// install for the life of the process.
+/// Probe once per executable identity. A version is cached until the file
+/// changes; a failure is retried after [`VERSION_FAILURE_TTL`], and a probe
+/// that timed out after [`INCONCLUSIVE_VERSION_TTL`], so one cold first exec
+/// cannot pin an older install for the life of the process.
 pub fn binary_version(path: &Path) -> Option<semver::Version> {
     binary_version_with(path, VERSION_PROBE_TIMEOUT)
 }
@@ -267,7 +271,8 @@ fn binary_version_with(path: &Path, timeout: std::time::Duration) -> Option<semv
         return version;
     }
     let (version, expires) = match probe_version(path, timeout) {
-        Probe::Answered(version) => (version, None),
+        Probe::Answered(Some(version)) => (Some(version), None),
+        Probe::Answered(None) => (None, Some(std::time::Instant::now() + VERSION_FAILURE_TTL)),
         Probe::Inconclusive => (
             None,
             Some(std::time::Instant::now() + INCONCLUSIVE_VERSION_TTL),
@@ -927,6 +932,36 @@ mod tests {
             .unwrap()
             .1;
         assert!(entry.expires.is_none(), "an answer is kept");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_probe_is_retried_once_its_failure_ages_out() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let answer = dir.path().join("answer");
+        let path = dir.path().join("flaky-cli");
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\ncat '{}' || exit 1\n", answer.display()),
+        )
+        .unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(binary_version(&path), None);
+        // The binary itself is unchanged, so its identity (and cache key) is too.
+        std::fs::write(&answer, "flaky-cli 1.2.3\n").unwrap();
+        assert_eq!(binary_version(&path), None, "a fresh failure is cached");
+        let canonical = path.canonicalize().unwrap();
+        for entry in version_cache()
+            .entries
+            .iter_mut()
+            .filter(|((p, _, _), _)| p == &canonical)
+            .map(|(_, entry)| entry)
+        {
+            assert!(entry.expires.is_some(), "a failure is cached only briefly");
+            entry.expires = Some(std::time::Instant::now());
+        }
+        assert_eq!(binary_version(&path), Some(semver::Version::new(1, 2, 3)));
     }
 
     /// Concurrent callers for one binary share a probe, and a slow binary

@@ -188,6 +188,23 @@ struct RunHandle {
     /// elsewhere): a parked session whose account has since changed is
     /// replaced before its next turn.
     credential: Option<String>,
+    /// The CLI binary the runtime was launched from ([`binary_identity`]): a
+    /// parked session whose CLI was since updated in place (by its own
+    /// auto-updater or by hand) is replaced before its next turn.
+    binary: Option<String>,
+}
+
+/// Which CLI binary a run of `harness` launches now: its real path, size and
+/// modification time. `None` when the harness has no CLI or it can't be found.
+fn binary_identity(harness: &dyn Harness) -> Option<String> {
+    let path = std::fs::canonicalize(harness.executable_path()?).ok()?;
+    let metadata = path.metadata().ok()?;
+    Some(format!(
+        "{}:{:?}:{}",
+        path.display(),
+        metadata.modified().ok(),
+        metadata.len()
+    ))
 }
 
 /// One accepted-but-unconfirmed steer: enough to re-dispatch it verbatim.
@@ -673,6 +690,8 @@ impl SessionsEngine {
                 h.fork_history_sent.clone(),
                 h.retiring.clone(),
                 h.credential.clone(),
+                h.binary.clone(),
+                h.runtime_config.harness.clone(),
             )
         });
         if let Some((
@@ -684,6 +703,8 @@ impl SessionsEngine {
             history_sent,
             retiring,
             credential,
+            binary,
+            live_harness,
         )) = routed
         {
             if idle {
@@ -695,10 +716,14 @@ impl SessionsEngine {
                     Err(EngineError::Other("incompatible live runtime".into()))
                 };
             }
-            // A parked session started with another account (Cloud): replace it.
+            // A parked session started with another account (Cloud), or from
+            // a CLI binary since updated: replace it.
             let route = if self
                 .credential_changed(chat_id, harness_id, credential.as_deref())
                 .await
+                || self
+                    .binary_changed(chat_id, harness_id, live_harness, binary.as_deref())
+                    .await
             {
                 None
             } else {
@@ -847,6 +872,13 @@ impl SessionsEngine {
             handle.write_user_message(&user_id, &request.prompt, now_ms())?;
         }
         let credential = self.inner.registry.run_credential(harness_id).await;
+        let binary = {
+            let harness = harness.clone();
+            tokio::task::spawn_blocking(move || binary_identity(harness.as_ref()))
+                .await
+                .ok()
+                .flatten()
+        };
 
         // Engine-owned resume (zeron sessions.ts:736 — every dispatch read the
         // chat's stored harness session): callers always send `resume: None`;
@@ -943,6 +975,7 @@ impl SessionsEngine {
                 fork_history_sent: fork_history_sent.clone(),
                 retiring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 credential,
+                binary,
             },
         );
         self.set_status(
@@ -1014,6 +1047,39 @@ impl SessionsEngine {
             Some(now) if Some(now.as_str()) != started_with => {
                 tracing::info!(chat = %chat_id, harness = ?harness_id,
                     "credential changed; replacing the parked session");
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a session parked between turns runs a CLI binary other than
+    /// the one a run would launch now (the CLI updated itself, or was updated
+    /// outside zeron, since it started). Same guards as
+    /// [`Self::credential_changed`]: never mid-turn, never with background
+    /// work on it, never on an unknown binary.
+    async fn binary_changed(
+        &self,
+        chat_id: &str,
+        harness_id: HarnessId,
+        harness: Arc<dyn Harness>,
+        started_with: Option<&str>,
+    ) -> bool {
+        let Some(started_with) = started_with else {
+            return false;
+        };
+        if self.turn_in_flight(chat_id) || self.holds_background_work(chat_id) {
+            return false;
+        }
+        // Resolving the CLI can probe candidates' versions (blocking).
+        let now = tokio::task::spawn_blocking(move || binary_identity(harness.as_ref()))
+            .await
+            .ok()
+            .flatten();
+        match now {
+            Some(now) if now != started_with => {
+                tracing::info!(chat = %chat_id, harness = ?harness_id,
+                    "agent CLI changed on disk; replacing the parked session");
                 true
             }
             _ => false,

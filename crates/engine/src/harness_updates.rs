@@ -17,8 +17,8 @@ use tokio_util::sync::CancellationToken;
 use zeron_harness::process::{Command, Stdio};
 
 use zeron_proto::{
-    HarnessId, HarnessInstallSource, HarnessUpdateFailure, HarnessUpdatePhase, HarnessUpdatePolicy,
-    HarnessUpdateProgress, HarnessUpdateStatus,
+    HarnessId, HarnessInstallSource, HarnessUpdateFailure, HarnessUpdateFailureKind,
+    HarnessUpdatePhase, HarnessUpdatePolicy, HarnessUpdateProgress, HarnessUpdateStatus,
 };
 
 use crate::now_ms;
@@ -29,6 +29,9 @@ const MAX_JITTER: u64 = 30 * 60;
 const FIRST_RETRY: Duration = Duration::from_secs(5 * 60);
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(20);
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Between full checks, how often each CLI's binary is looked at (stat only)
+/// for an update made outside zeron — its own auto-updater or the user.
+const BINARY_WATCH_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
@@ -107,6 +110,60 @@ enum UpdatePlan {
     AntigravityArchive,
     CodexStandalone(CodexStandaloneInstall),
     Homebrew(HomebrewPackage),
+}
+
+impl UpdatePlan {
+    /// The installation owner whose updater this plan runs, when another CLI
+    /// can share it: a Homebrew prefix, or the npm global prefix an npm
+    /// package's self-updater reinstalls into.
+    fn owner(&self) -> Option<String> {
+        match self {
+            UpdatePlan::Homebrew(package) => Some(format!("homebrew:{}", package.brew.display())),
+            UpdatePlan::Command { executable, .. } => {
+                npm_global_prefix(executable).map(|prefix| format!("npm:{}", prefix.display()))
+            }
+            UpdatePlan::AntigravityArchive | UpdatePlan::CodexStandalone(_) => None,
+        }
+    }
+}
+
+/// The npm prefix owning an executable installed as a global package:
+/// `<prefix>/lib/node_modules/…` (Unix) or `<prefix>/node_modules/…`
+/// (Windows), judged by where the launcher really lives.
+fn npm_global_prefix(executable: &Path) -> Option<PathBuf> {
+    let canonical = std::fs::canonicalize(executable).ok()?;
+    let mut prefix = PathBuf::new();
+    for component in canonical.components() {
+        if component.as_os_str() == "node_modules" {
+            if prefix.file_name().is_some_and(|name| name == "lib") {
+                prefix.pop();
+            }
+            return (!prefix.as_os_str().is_empty()).then_some(prefix);
+        }
+        prefix.push(component);
+    }
+    None
+}
+
+/// Identity of an installed CLI: where it really lives, and its size and
+/// modification time there. Two stats, so it is cheap enough to watch often.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BinaryFingerprint {
+    path: PathBuf,
+    modified: Option<std::time::SystemTime>,
+    len: u64,
+}
+
+impl BinaryFingerprint {
+    fn of(executable: &Path) -> Option<Self> {
+        let path = std::fs::canonicalize(executable).ok()?;
+        let metadata = path.metadata().ok()?;
+        Some(Self {
+            path,
+            modified: metadata.modified().ok(),
+            len: metadata.len(),
+        })
+    }
 }
 
 struct ReleaseAsset {
@@ -342,6 +399,14 @@ struct Inner {
     status_tx: watch::Sender<Vec<HarnessUpdateStatus>>,
     cancellations: Mutex<HashMap<HarnessId, ActiveUpdate>>,
     operation_gates: Mutex<HashMap<HarnessId, Arc<tokio::sync::Mutex<()>>>>,
+    /// One updater per installation owner (a Homebrew prefix, an npm global
+    /// prefix): two CLIs it manages must not run `brew upgrade` or npm in the
+    /// same prefix at once — the owner's own lock fails the second one.
+    owner_gates: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// The executable each harness's last completed check probed (see
+    /// [`BinaryFingerprint`]): a later difference means the CLI changed
+    /// outside zeron, so its status is stale.
+    checked_binaries: Mutex<HashMap<HarnessId, BinaryFingerprint>>,
     check_slots: tokio::sync::Semaphore,
     shutdown: CancellationToken,
     worker: Mutex<Option<tokio::task::JoinHandle<()>>>,
@@ -391,6 +456,7 @@ impl Drop for UpdateIntentGuard {
                     message: "update ended before verification; inspect the CLI installation"
                         .into(),
                     retryable: true,
+                    kind: HarnessUpdateFailureKind::Install,
                 });
             } else {
                 status.phase = if status.policy == HarnessUpdatePolicy::Off {
@@ -459,6 +525,8 @@ impl HarnessUpdateCoordinator {
                 status_tx,
                 cancellations: Mutex::new(HashMap::new()),
                 operation_gates: Mutex::new(HashMap::new()),
+                owner_gates: Mutex::new(HashMap::new()),
+                checked_binaries: Mutex::new(HashMap::new()),
                 check_slots: tokio::sync::Semaphore::new(2),
                 shutdown: CancellationToken::new(),
                 worker: Mutex::new(None),
@@ -486,7 +554,7 @@ impl HarnessUpdateCoordinator {
         let coordinator = self.clone();
         *worker = Some(tokio::spawn(async move {
             let mut retry = FIRST_RETRY;
-            loop {
+            'checks: loop {
                 // Shutdown must not wait out slow probes or registry requests.
                 let snapshot = tokio::select! {
                     _ = coordinator.inner.shutdown.cancelled() => break,
@@ -504,12 +572,72 @@ impl HarnessUpdateCoordinator {
                     let jitter = (now_ms().unsigned_abs() % MAX_JITTER) + 1;
                     CHECK_INTERVAL + Duration::from_secs(jitter)
                 };
-                tokio::select! {
-                    _ = coordinator.inner.shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(delay) => {}
+                let next_check = tokio::time::Instant::now() + delay;
+                loop {
+                    let tick =
+                        (tokio::time::Instant::now() + BINARY_WATCH_INTERVAL).min(next_check);
+                    tokio::select! {
+                        _ = coordinator.inner.shutdown.cancelled() => break 'checks,
+                        _ = tokio::time::sleep_until(tick) => {}
+                    }
+                    if tokio::time::Instant::now() >= next_check {
+                        break;
+                    }
+                    tokio::select! {
+                        _ = coordinator.inner.shutdown.cancelled() => break 'checks,
+                        _ = coordinator.recheck_changed_binaries() => {}
+                    }
                 }
             }
         }));
+    }
+
+    /// [`Self::recheck_changed_binaries`] in the background: a status view
+    /// just opened, and a row stale since an outside update would show now.
+    pub fn recheck_changed_binaries_soon(&self) {
+        if tokio::runtime::Handle::try_current().is_err() {
+            return;
+        }
+        let coordinator = self.clone();
+        tokio::spawn(async move { coordinator.recheck_changed_binaries().await });
+    }
+
+    /// Re-check every monitored CLI whose binary changed since its last
+    /// check (see [`BinaryFingerprint`]). Unchanged ones cost two stats and
+    /// no subprocess or network request.
+    pub async fn recheck_changed_binaries(&self) {
+        let coordinator = self.clone();
+        // Resolving an executable can probe candidates' versions (blocking).
+        let changed = tokio::task::spawn_blocking(move || coordinator.changed_binaries())
+            .await
+            .unwrap_or_default();
+        for harness in changed {
+            tracing::info!(?harness, "agent CLI changed on disk; checking for updates");
+            let _ = self.check_one(harness).await;
+        }
+    }
+
+    fn changed_binaries(&self) -> Vec<HarnessId> {
+        let enabled = self.inner.registry.enabled_set();
+        enabled
+            .into_iter()
+            .filter(|harness| {
+                self.inner.order.contains(harness)
+                    && self.policy(*harness) != HarnessUpdatePolicy::Off
+                    && !self.is_mutating(*harness)
+                    && self.status(*harness).phase != HarnessUpdatePhase::Checking
+            })
+            .filter(|harness| {
+                let Some(last) = lock(&self.inner.checked_binaries).get(harness).cloned() else {
+                    // Never checked: the periodic check owns it.
+                    return false;
+                };
+                self.executable(*harness)
+                    .ok()
+                    .and_then(|executable| BinaryFingerprint::of(&executable))
+                    .is_some_and(|now| now != last)
+            })
+            .collect()
     }
 
     pub fn watch(&self) -> watch::Receiver<Vec<HarnessUpdateStatus>> {
@@ -641,6 +769,9 @@ impl HarnessUpdateCoordinator {
                 return self.fail_check(harness, error);
             }
         };
+        if let Some(fingerprint) = BinaryFingerprint::of(&executable) {
+            lock(&self.inner.checked_binaries).insert(harness, fingerprint);
+        }
         let source = classify_source(&executable);
         let can_apply = can_apply_update(harness, &executable);
         if self.settle_if_unmonitored(harness) {
@@ -736,7 +867,8 @@ impl HarnessUpdateCoordinator {
             Ok(UpdateCheck::Available) => (None, true),
             Ok(UpdateCheck::Current) => (None, false),
             Ok(UpdateCheck::Manual) => {
-                let registry = self.inner.registry.clone();
+                // Computed outside the status lock: it runs the CLIs' install probes.
+                let enabled = self.inner.registry.enabled_set().contains(&harness);
                 self.mutate(harness, |status| {
                     status.installed_version = Some(installed);
                     status.latest_version = None;
@@ -745,9 +877,7 @@ impl HarnessUpdateCoordinator {
                     status.can_apply = can_apply;
                     status.manual_command = manual_update_command(harness, &executable, can_apply)
                         .or_else(|| Some(spec.manual_command.into()));
-                    status.phase = if status.policy == HarnessUpdatePolicy::Off
-                        || !registry.enabled_set().contains(&harness)
-                    {
+                    status.phase = if status.policy == HarnessUpdatePolicy::Off || !enabled {
                         HarnessUpdatePhase::Dormant
                     } else {
                         HarnessUpdatePhase::ManualActionRequired
@@ -770,16 +900,15 @@ impl HarnessUpdateCoordinator {
                     .as_ref()
                     .is_some_and(|release| release.installable()));
         let manual_command = manual_update_command(harness, &executable, can_apply);
-        let registry = self.inner.registry.clone();
+        // Computed outside the status lock: it runs the CLIs' install probes.
+        let enabled = self.inner.registry.enabled_set().contains(&harness);
         self.mutate(harness, |status| {
             status.installed_version = Some(installed);
             status.latest_version = latest;
             status.source = source;
             status.can_apply = can_apply;
             status.manual_command = manual_command;
-            status.phase = if status.policy == HarnessUpdatePolicy::Off
-                || !registry.enabled_set().contains(&harness)
-            {
+            status.phase = if status.policy == HarnessUpdatePolicy::Off || !enabled {
                 HarnessUpdatePhase::Dormant
             } else if available {
                 HarnessUpdatePhase::Available
@@ -838,7 +967,8 @@ impl HarnessUpdateCoordinator {
             .then(|| claude_cask_channel(executable))
             .flatten()
             .map(str::to_owned);
-        let registry = self.inner.registry.clone();
+        // Computed outside the status lock: it runs the CLIs' install probes.
+        let enabled = self.inner.registry.enabled_set().contains(&harness);
         self.mutate(harness, |status| {
             status.installed_version = Some(installed);
             status.latest_version = Some(latest);
@@ -848,9 +978,7 @@ impl HarnessUpdateCoordinator {
             status.source = source;
             status.can_apply = true;
             status.manual_command = manual_command;
-            status.phase = if status.policy == HarnessUpdatePolicy::Off
-                || !registry.enabled_set().contains(&harness)
-            {
+            status.phase = if status.policy == HarnessUpdatePolicy::Off || !enabled {
                 HarnessUpdatePhase::Dormant
             } else if available {
                 HarnessUpdatePhase::Available
@@ -968,10 +1096,18 @@ impl HarnessUpdateCoordinator {
             .into_iter()
             .find(|status| status.harness == harness)
             .ok_or_else(|| "unknown harness".to_string())?;
-        if !matches!(
-            current.phase,
-            HarnessUpdatePhase::Available | HarnessUpdatePhase::ManualActionRequired
-        ) {
+        // A failed install still knows its release: retrying it is an update.
+        let retry = current.phase == HarnessUpdatePhase::Failed
+            && current
+                .error
+                .as_ref()
+                .is_some_and(|error| error.kind == HarnessUpdateFailureKind::Install);
+        if !retry
+            && !matches!(
+                current.phase,
+                HarnessUpdatePhase::Available | HarnessUpdatePhase::ManualActionRequired
+            )
+        {
             return Err("no applicable harness update".into());
         }
         if !current.can_apply {
@@ -1033,6 +1169,47 @@ impl HarnessUpdateCoordinator {
             self.finish_cancelled(harness);
             intent.finish();
             return Err("update cancelled".into());
+        }
+        let _owner = match plan.owner() {
+            Some(owner) => {
+                let gate = self.owner_gate(&owner);
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        drop(lease);
+                        self.finish_cancelled(harness);
+                        intent.finish();
+                        return Err("update cancelled".into());
+                    }
+                    owner = gate.lock_owned() => Some(owner),
+                }
+            }
+            None => None,
+        };
+        // CLIs update themselves (and get updated by hand) between checks. One
+        // already at or past the release the check found must not be
+        // "updated" to it: at best a no-op, for an in-place release switch a
+        // silent downgrade. Nothing runs it now: the exclusive lease is held.
+        if let Some(latest) = current.latest_version.as_deref()
+            && let Ok(installed) =
+                run_version_command(harness, &executable, provider(harness).version_args).await
+            && !version_is_newer(latest, &installed)
+        {
+            drop(lease);
+            lock(&self.inner.cancellations).remove(&harness);
+            self.inner.registry.end_update(harness);
+            self.mutate(harness, |status| {
+                status.installed_version = Some(installed.clone());
+                status.progress = None;
+                status.error = None;
+                status.checked_at = Some(now_ms());
+                status.phase = if status.policy == HarnessUpdatePolicy::Off {
+                    HarnessUpdatePhase::Dormant
+                } else {
+                    HarnessUpdatePhase::Current
+                };
+            });
+            intent.finish();
+            return Ok(installed);
         }
         let applied = match plan {
             UpdatePlan::Command { executable, args } => {
@@ -1146,7 +1323,7 @@ impl HarnessUpdateCoordinator {
         // Wake shutdown even if it already consumed that final status frame.
         self.inner.status_tx.send_modify(|_| {});
         if let Err(error) = &result {
-            self.fail(harness, error.clone()).ok();
+            self.fail_install(harness, error.clone()).ok();
         } else {
             let coordinator = self.clone();
             tokio::spawn(async move {
@@ -1411,6 +1588,13 @@ impl HarnessUpdateCoordinator {
             .clone()
     }
 
+    fn owner_gate(&self, owner: &str) -> Arc<tokio::sync::Mutex<()>> {
+        lock(&self.inner.owner_gates)
+            .entry(owner.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     fn settle_if_unmonitored(&self, harness: HarnessId) -> bool {
         let monitored = self.policy(harness) != HarnessUpdatePolicy::Off
             && self.inner.registry.enabled_set().contains(&harness);
@@ -1558,6 +1742,16 @@ impl HarnessUpdateCoordinator {
         if !safe_component(&install.target) {
             return Err("Codex standalone target is invalid".into());
         }
+        // Switching `current` is the whole install, and older releases stay on
+        // disk: never point it back at one.
+        if let Ok(active) = read_codex_manifest(&install.root.join("current"))
+            && !version_is_newer(version, &active.version)
+        {
+            return Err(format!(
+                "Codex {} is already installed; not switching back to {version}",
+                active.version
+            ));
+        }
         let tag = format!("rust-v{version}");
         let asset_name = format!("codex-package-{}.tar.gz", install.target);
         let asset = cancellable(
@@ -1693,24 +1887,24 @@ impl HarnessUpdateCoordinator {
         lock(&self.inner.cancellations).contains_key(&harness)
     }
 
-    fn fail(&self, harness: HarnessId, error: String) -> Result<(), String> {
+    fn fail_install(&self, harness: HarnessId, error: String) -> Result<(), String> {
         self.mutate(harness, |status| {
             status.phase = HarnessUpdatePhase::Failed;
             status.checked_at = Some(now_ms());
             status.error = Some(HarnessUpdateFailure {
                 message: error.clone(),
                 retryable: true,
+                kind: HarnessUpdateFailureKind::Install,
             });
         });
         Err(error)
     }
 
     fn fail_check(&self, harness: HarnessId, error: String) -> Result<(), String> {
-        let registry = self.inner.registry.clone();
+        // Computed outside the status lock: it runs the CLIs' install probes.
+        let enabled = self.inner.registry.enabled_set().contains(&harness);
         self.mutate(harness, |status| {
-            if status.policy == HarnessUpdatePolicy::Off
-                || !registry.enabled_set().contains(&harness)
-            {
+            if status.policy == HarnessUpdatePolicy::Off || !enabled {
                 status.phase = HarnessUpdatePhase::Dormant;
                 status.error = None;
             } else {
@@ -1719,6 +1913,7 @@ impl HarnessUpdateCoordinator {
                 status.error = Some(HarnessUpdateFailure {
                     message: error.clone(),
                     retryable: true,
+                    kind: HarnessUpdateFailureKind::Check,
                 });
             }
         });
@@ -1760,7 +1955,7 @@ impl HarnessUpdateCoordinator {
     fn finish_failed_update(&self, harness: HarnessId, error: String) {
         lock(&self.inner.cancellations).remove(&harness);
         self.inner.registry.end_update(harness);
-        self.fail(harness, error).ok();
+        self.fail_install(harness, error).ok();
     }
 
     fn persist_preferences(&self) {
@@ -2235,17 +2430,14 @@ async fn run_command_output_env(
     let mut stderr = child.stderr.take().expect("updater stderr is piped");
     let mut stdout_bytes = Vec::new();
     let mut stderr_bytes = Vec::new();
-    let result = {
-        use tokio::io::AsyncReadExt as _;
-        tokio::time::timeout(timeout, async {
-            tokio::try_join!(
-                child.wait(),
-                stdout.read_to_end(&mut stdout_bytes),
-                stderr.read_to_end(&mut stderr_bytes),
-            )
-        })
-        .await
-    };
+    let result = tokio::time::timeout(timeout, async {
+        tokio::try_join!(
+            child.wait(),
+            read_tail(&mut stdout, &mut stdout_bytes),
+            read_tail(&mut stderr, &mut stderr_bytes),
+        )
+    })
+    .await;
     // Stop descendants before returning and releasing the execution lease,
     // including when the leader exited but a descendant kept its pipes open.
     #[cfg(unix)]
@@ -2270,17 +2462,81 @@ async fn run_command_output_env(
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_owned();
     let stderr = String::from_utf8_lossy(&output.stderr).trim().to_owned();
     if !output.status.success() {
-        let detail = if stderr.is_empty() { stdout } else { stderr };
+        let detail = if stderr.is_empty() { &stdout } else { &stderr };
+        tracing::warn!(
+            executable = %executable.display(),
+            status = %output.status,
+            output = %last_chars(detail, 4000),
+            "agent CLI command failed"
+        );
+        // The full output is in the log; the reason is almost always its
+        // last line (npm's, brew's and the vendors' updaters all end there).
         return Err(format!(
             "{} exited with {}{}",
             executable.display(),
             output.status,
-            (!detail.is_empty())
-                .then(|| format!(": {detail}"))
+            failure_summary(detail)
+                .map(|line| format!(": {line}"))
                 .unwrap_or_default()
         ));
     }
     Ok(if stdout.is_empty() { stderr } else { stdout })
+}
+
+/// Updaters can print without bound (npm and Homebrew logs); keep only the
+/// last [`OUTPUT_CAP`] bytes of a stream.
+const OUTPUT_CAP: usize = 1024 * 1024;
+
+async fn read_tail(
+    pipe: &mut (impl tokio::io::AsyncRead + Unpin),
+    tail: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncReadExt as _;
+    let mut chunk = [0_u8; 16 * 1024];
+    loop {
+        let read = pipe.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        tail.extend_from_slice(&chunk[..read]);
+        // Drain in batches so a chatty updater isn't memmoved per chunk.
+        if tail.len() > 2 * OUTPUT_CAP {
+            tail.drain(..tail.len() - OUTPUT_CAP);
+        }
+    }
+    if tail.len() > OUTPUT_CAP {
+        tail.drain(..tail.len() - OUTPUT_CAP);
+    }
+    Ok(())
+}
+
+/// The last line of `output` that says something (not blank, not a bare
+/// progress or box-drawing line), capped for a one-line status.
+fn failure_summary(output: &str) -> Option<String> {
+    let line = output
+        .lines()
+        .map(str::trim)
+        .rev()
+        .find(|line| line.chars().any(char::is_alphanumeric))?;
+    Some(first_chars(line, 300).into_owned())
+}
+
+/// At most the first `max` characters of `text`, marked when cut.
+fn first_chars(text: &str, max: usize) -> std::borrow::Cow<'_, str> {
+    match text.char_indices().nth(max) {
+        Some((cut, _)) => format!("{}…", &text[..cut]).into(),
+        None => text.into(),
+    }
+}
+
+/// At most the last `max` characters of `text`.
+fn last_chars(text: &str, max: usize) -> &str {
+    let start = text
+        .char_indices()
+        .rev()
+        .nth(max.saturating_sub(1))
+        .map_or(0, |(i, _)| i);
+    &text[start..]
 }
 
 fn version_tokens(text: &str) -> impl Iterator<Item = String> + '_ {
@@ -2336,11 +2592,63 @@ fn opencode_release_package(installed: &str) -> &'static str {
 
 fn version_is_newer(latest: &str, installed: &str) -> bool {
     match (version_numbers(latest), version_numbers(installed)) {
-        (Some(mut latest), Some(mut installed)) => {
-            let width = latest.len().max(installed.len());
-            latest.resize(width, 0);
-            installed.resize(width, 0);
-            latest > installed
+        (Some(mut latest_numbers), Some(mut installed_numbers)) => {
+            let width = latest_numbers.len().max(installed_numbers.len());
+            latest_numbers.resize(width, 0);
+            installed_numbers.resize(width, 0);
+            match latest_numbers.cmp(&installed_numbers) {
+                std::cmp::Ordering::Equal => {
+                    prerelease_is_newer(prerelease(latest), prerelease(installed))
+                }
+                ordering => ordering.is_gt(),
+            }
+        }
+        _ => false,
+    }
+}
+
+/// The pre-release label of `version` (`2.0.0-beta.2` → `beta.2`). Only
+/// labels that read as pre-releases count: vendors also append build or
+/// commit suffixes (`1.4.0-3f2a1c`), and treating those as older than the
+/// bare release would offer the same version forever.
+fn prerelease(version: &str) -> Option<&str> {
+    let version = version.trim().trim_start_matches('v');
+    let label = version.split('+').next()?.split_once('-')?.1;
+    let lower = label.to_ascii_lowercase();
+    [
+        "alpha", "beta", "rc", "pre", "preview", "canary", "next", "dev", "nightly",
+    ]
+    .iter()
+    .any(|tag| lower.starts_with(tag))
+    .then_some(label)
+}
+
+/// Semver pre-release precedence for two versions with equal numbers: a
+/// release outranks any of its pre-releases; two pre-releases compare by
+/// dot-separated identifiers (numeric ones numerically, numbers below words).
+fn prerelease_is_newer(latest: Option<&str>, installed: Option<&str>) -> bool {
+    match (latest, installed) {
+        (None, Some(_)) => true,
+        (Some(latest), Some(installed)) => {
+            let mut latest = latest.split('.');
+            let mut installed = installed.split('.');
+            loop {
+                match (latest.next(), installed.next()) {
+                    (Some(a), Some(b)) => {
+                        let ordering = match (a.parse::<u64>(), b.parse::<u64>()) {
+                            (Ok(a), Ok(b)) => a.cmp(&b),
+                            (Ok(_), Err(_)) => std::cmp::Ordering::Less,
+                            (Err(_), Ok(_)) => std::cmp::Ordering::Greater,
+                            (Err(_), Err(_)) => a.cmp(b),
+                        };
+                        if ordering.is_ne() {
+                            return ordering.is_gt();
+                        }
+                    }
+                    (Some(_), None) => return true,
+                    _ => return false,
+                }
+            }
         }
         _ => false,
     }
@@ -3160,6 +3468,21 @@ esac
         assert!(version_is_newer("1.2.1", "1.2"));
         assert!(!version_is_newer("1.2.0", "1.2"));
         assert!(!version_is_newer("1.1.9", "1.2.0"));
+    }
+
+    #[test]
+    fn a_release_outranks_its_prereleases_but_not_build_suffixes() {
+        assert!(version_is_newer("2.0.0", "2.0.0-beta.3"));
+        assert!(version_is_newer("2.0.0-beta.10", "2.0.0-beta.9"));
+        assert!(version_is_newer("2.0.0-rc.1", "2.0.0-beta.9"));
+        assert!(version_is_newer("2.0.0-beta", "2.0.0-alpha.4"));
+        assert!(version_is_newer("2.0.0-beta.1", "2.0.0-beta"));
+        assert!(!version_is_newer("2.0.0-beta.3", "2.0.0"));
+        assert!(!version_is_newer("2.0.0-beta.3", "2.0.0-beta.3"));
+        assert!(!version_is_newer("2.0.0-rc.1", "2.0.1"));
+        // A vendor build/commit suffix is the same release, not a pre-release.
+        assert!(!version_is_newer("1.4.0", "1.4.0-3f2a1c"));
+        assert!(!version_is_newer("1.4.0", "1.4.0+build.7"));
     }
 
     #[test]
