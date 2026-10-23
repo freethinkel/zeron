@@ -120,10 +120,12 @@ pub(crate) fn turn_error_message(params: &Value, limits: Option<&Value>) -> Opti
         .map(|e| codex_error_text(e, limits))
 }
 
-/// What the person reads when Codex has no usable login. The UI offers its
-/// sign-in action on this text (`zeron_proto::run_errors`).
-pub(crate) const SIGNED_OUT_MESSAGE: &str =
-    "Codex isn't signed in or its login expired. Run codex login, then send again.";
+/// What the person reads when the provider refuses Codex's credentials (a
+/// 401): a missing or expired ChatGPT login, or an API key — OpenAI's or a
+/// custom provider's — that is wrong or revoked. The UI offers its sign-in
+/// action on this text (`zeron_proto::run_errors` matches "run codex login").
+pub(crate) const SIGNED_OUT_MESSAGE: &str = "Codex's credentials were rejected. Run codex login \
+     (or check the API key for your model provider), then send again.";
 
 /// A Codex `TurnError` (`turn.error`, or an `error` notification's `error`)
 /// as display text. The structured `codexErrorInfo` decides the sign-in and
@@ -1287,6 +1289,8 @@ mod tests {
             provider_problem(&signed_out),
             Some(ProviderProblem::SignedOut)
         );
+        // A 401 is not always a ChatGPT login: API-key users are told too.
+        assert!(signed_out.contains("API key"), "{signed_out}");
 
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
