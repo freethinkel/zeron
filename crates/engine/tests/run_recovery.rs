@@ -1062,3 +1062,212 @@ async fn a_rejected_resume_in_a_switched_chat_starts_fresh_and_says_so() {
     assert_eq!(pi_log.lock().unwrap()[3].resume.as_deref(), Some("hs-pi-2"));
     core.shutdown().await;
 }
+
+/// Holds a dispatch inside its own awaits, before its run starts: the
+/// engine reads the harness's CLI there (`binary_identity`), so the first
+/// CLI lookup once armed blocks until released.
+#[derive(Clone, Default)]
+struct DispatchGate {
+    armed: Arc<std::sync::atomic::AtomicBool>,
+    entered: Arc<std::sync::atomic::AtomicBool>,
+    released: Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl DispatchGate {
+    fn arm(&self) {
+        self.armed.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn entered(&self) -> bool {
+        self.entered.load(std::sync::atomic::Ordering::SeqCst)
+    }
+    fn release(&self) {
+        self.released
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+    fn pass(&self) {
+        if self.armed.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            self.entered
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            while !self.released.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
+/// A [`ScriptedHarness`] whose CLI lookup passes through a [`DispatchGate`].
+struct GatedHarness {
+    gate: DispatchGate,
+    script: ScriptedHarness,
+}
+
+#[async_trait]
+impl Harness for GatedHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Gated"
+    }
+    fn executable_path(&self) -> Option<std::path::PathBuf> {
+        self.gate.pass();
+        None
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let gate = self.gate.clone();
+        let started = self.script.run(request, controls).await;
+        // The next dispatch (the retry of a failed start) is held.
+        if started.is_err() {
+            gate.arm();
+        }
+        started
+    }
+}
+
+#[tokio::test]
+async fn a_stop_between_a_failed_start_and_its_retry_ends_the_turn() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    let gate = DispatchGate::default();
+    let core = assemble(
+        &dir,
+        GatedHarness {
+            gate: gate.clone(),
+            script: ScriptedHarness {
+                requests: requests.clone(),
+                script: Arc::new(|request, call| {
+                    if call == 0 {
+                        Err(HarnessError::Io(std::io::Error::from(
+                            std::io::ErrorKind::ResourceBusy,
+                        )))
+                    } else {
+                        Ok(completed_turn("hs-1", &format!("ack: {}", request.prompt)))
+                    }
+                }),
+            },
+        },
+    );
+    pre_title(&core);
+    queue_run(&core, "hello", "msg-user-1");
+    // The failed run is gone and its retry not started yet: no run is live
+    // for the Stop to find.
+    wait_for(|| gate.entered(), "the retry to be on its way").await;
+    assert!(!core.sessions.has_run(CHAT));
+    core.sessions.interrupt(CHAT).await.unwrap();
+    gate.release();
+    settle().await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "the stopped turn never starts again"
+    );
+    assert_eq!(
+        core.sessions.session_status(CHAT).map(|s| s.status),
+        Some(SessionStatus::Idle)
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_shutdown_during_a_start_retry_starts_nothing_and_revives_on_boot() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    let core = assemble(
+        &dir,
+        refusing(&requests, std::io::ErrorKind::ResourceBusy, 1, None),
+    );
+    pre_title(&core);
+    queue_run(&core, "hello", "msg-user-1");
+    wait_for(|| !requests.lock().unwrap().is_empty(), "the failed start").await;
+    // Inside the retry's backoff.
+    core.shutdown().await;
+    settle().await;
+    assert_eq!(
+        requests.lock().unwrap().len(),
+        1,
+        "nothing starts during shutdown"
+    );
+    drop(core);
+
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-1"));
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "the cut-off turn to be picked back up",
+    )
+    .await;
+    assert_eq!(requests.lock().unwrap()[0].prompt, "hello");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_revival_yields_to_a_message_sent_while_it_was_on_its_way() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    manufacture_crash(
+        &dir,
+        "long task",
+        Some("partial…"),
+        &[
+            session_started("hs-crash"),
+            AgentEvent::TextDelta {
+                text: "partial…".into(),
+            },
+        ],
+    );
+    let requests: RequestLog = Default::default();
+    let gate = DispatchGate::default();
+    // Boot recovery's revival is held before its run starts.
+    gate.arm();
+    let core = assemble(
+        &dir,
+        GatedHarness {
+            gate: gate.clone(),
+            script: ScriptedHarness::completing(&requests, "hs-crash"),
+        },
+    );
+    wait_for(|| gate.entered(), "the revival to be on its way").await;
+    // Meanwhile the user sends something new.
+    core.sessions
+        .dispatch(
+            CHAT,
+            HarnessId::Mock,
+            run_request("something else"),
+            Some("msg-user-2".into()),
+        )
+        .await
+        .unwrap();
+    wait_for(
+        || !requests.lock().unwrap().is_empty(),
+        "the new message to reach the provider",
+    )
+    .await;
+    gate.release();
+    settle().await;
+    let log = requests.lock().unwrap().clone();
+    assert_eq!(
+        log.len(),
+        1,
+        "the old turn is not delivered again: {log:#?}"
+    );
+    assert_eq!(log[0].prompt, "something else");
+    core.shutdown().await;
+}
