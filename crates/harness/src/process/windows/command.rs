@@ -76,7 +76,10 @@ impl Command {
     pub(super) fn prepare(&self) -> io::Result<Prepared> {
         // CreateProcessW's error for a missing working directory reads like a
         // missing executable to callers that treat NotFound as "not installed".
+        // A name no directory can have (an embedded NUL) is invalid input,
+        // reported below with the other unencodable values.
         if let Some(dir) = self.metadata.get_current_dir()
+            && !dir.as_os_str().encode_wide().any(|unit| unit == 0)
             && !dir.is_dir()
         {
             return Err(io::Error::new(
