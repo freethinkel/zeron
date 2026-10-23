@@ -138,6 +138,16 @@ impl Harness for ScriptedHarness {
 /// (or parks it on a question) until the engine interrupts it.
 struct HoldingHarness {
     ask: bool,
+    on_interrupt: OnInterrupt,
+}
+
+/// What a [`HoldingHarness`] turn does when the engine interrupts it.
+#[derive(Clone, Copy)]
+enum OnInterrupt {
+    /// Its stream ends: the engine reads the turn as interrupted.
+    End,
+    /// The turn finishes just then: a completed `Done`.
+    Finish,
 }
 
 #[async_trait]
@@ -167,6 +177,7 @@ impl Harness for HoldingHarness {
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
         let ask = self.ask;
+        let on_interrupt = self.on_interrupt;
         tokio::spawn(async move {
             let _ = tx.send(Ok(session_started("hs-held")));
             let _ = tx.send(Ok(AgentEvent::TextDelta {
@@ -174,7 +185,17 @@ impl Harness for HoldingHarness {
             }));
             let _answer = ask.then(|| (controls.request_input)(Vec::new()));
             controls.interrupt.cancelled().await;
-            drop(tx); // the stream ends: the engine reads it as interrupted
+            match on_interrupt {
+                OnInterrupt::End => drop(tx),
+                OnInterrupt::Finish => {
+                    let _ = tx.send(Ok(AgentEvent::Done {
+                        status: DoneStatus::Completed,
+                        result: None,
+                        error: None,
+                        session_id: Some("hs-held".into()),
+                    }));
+                }
+            }
         });
         Ok(futures::stream::unfold(
             rx,
@@ -493,7 +514,18 @@ async fn a_message_the_user_sends_resets_the_revival_budget() {
 
 /// Phase one of the shutdown tests: a turn streaming in a held run.
 async fn hold_a_turn(dir: &std::path::Path, ask: bool) -> EngineCore {
-    let core = assemble(dir, HoldingHarness { ask });
+    let core = assemble(
+        dir,
+        HoldingHarness {
+            ask,
+            on_interrupt: OnInterrupt::End,
+        },
+    );
+    hold_a_turn_in(core, ask).await
+}
+
+/// [`hold_a_turn`] in an engine assembled by the caller.
+async fn hold_a_turn_in(core: EngineCore, ask: bool) -> EngineCore {
     pre_title(&core);
     queue_run(&core, "long task", "msg-user-1");
     let want = if ask {
@@ -600,6 +632,54 @@ async fn a_shutdown_while_waiting_for_an_answer_is_not_revived() {
     let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
     settle().await;
     assert!(requests.lock().unwrap().is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_turn_that_finishes_during_shutdown_is_not_revived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    // Working when the shutdown began; done by the time it was stopped.
+    let core = assemble(
+        &dir,
+        HoldingHarness {
+            ask: false,
+            on_interrupt: OnInterrupt::Finish,
+        },
+    );
+    let core = hold_a_turn_in(core, false).await;
+    core.shutdown().await;
+    drop(core);
+    assert!(journal(&dir).shutdown_interrupts().unwrap().is_empty());
+
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+    settle().await;
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a finished turn is not carried on"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_shutdown_mark_over_a_finished_turn_is_ignored() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    // An engine that marked its working turns up front, one of which then
+    // finished before it was stopped.
+    manufacture_crash(
+        &dir,
+        "long task",
+        None,
+        &completed_turn("hs-done", "all done"),
+    );
+    journal(&dir).note_shutdown_interrupt(CHAT, now_ms());
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-after"));
+    settle().await;
+    assert!(requests.lock().unwrap().is_empty());
+    assert!(journal(&dir).shutdown_interrupts().unwrap().is_empty());
     core.shutdown().await;
 }
 

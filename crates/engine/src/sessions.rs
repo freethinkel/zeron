@@ -184,6 +184,10 @@ struct RunHandle {
     /// is unambiguously before the stop (cancelled with it) or after it
     /// (re-dispatched to a fresh runtime — never lost).
     retiring: Arc<std::sync::atomic::AtomicBool>,
+    /// The turn was working when the engine's shutdown began, and no Stop
+    /// has claimed it since: if the shutdown is what ends it, the next boot
+    /// picks it back up (see [`Inner::mark_shutdown_cut`]).
+    shutdown_cut: std::sync::atomic::AtomicBool,
     /// The credential the run started with (a Cloud device's broker; `None`
     /// elsewhere): a parked session whose account has since changed is
     /// replaced before its next turn.
@@ -974,6 +978,7 @@ impl SessionsEngine {
                 routed_steers: Arc::new(Mutex::new(std::collections::VecDeque::new())),
                 fork_history_sent: fork_history_sent.clone(),
                 retiring: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                shutdown_cut: std::sync::atomic::AtomicBool::new(false),
                 credential,
                 binary,
             },
@@ -1398,7 +1403,10 @@ impl SessionsEngine {
 
         // chat → `Some(shutdown time)` for a shutdown's mark, `None` for a
         // crash. A stale journal wins: the engine died before its shutdown
-        // closed the turn.
+        // closed the turn. A mark counts only over the turn it was made for:
+        // a journal whose last turn ended some other way (an older engine
+        // marked up front, and that turn went on to finish) has nothing to
+        // pick back up.
         let mut cut_off: std::collections::BTreeMap<String, Option<i64>> = self
             .inner
             .journal
@@ -1407,7 +1415,12 @@ impl SessionsEngine {
             .map(|chat_id| (chat_id, None))
             .collect();
         for (chat_id, at) in self.inner.journal.shutdown_interrupts()? {
-            cut_off.entry(chat_id).or_insert(Some(at));
+            if cut_off.contains_key(&chat_id) || self.inner.ended_by_shutdown(&chat_id) {
+                cut_off.entry(chat_id).or_insert(Some(at));
+            } else {
+                tracing::info!(chat = %chat_id, "shutdown mark over a turn that ended otherwise: ignored");
+                self.inner.journal.clear_shutdown_interrupt(&chat_id);
+            }
         }
         let mut recovered = 0usize;
         for (chat_id, shutdown_at) in cut_off {
@@ -1474,7 +1487,7 @@ impl SessionsEngine {
             }
             // A crash's journal can stay open past a finished turn: a parked
             // session's background subagents journal on after its Done. A
-            // shutdown only marks a turn it found working.
+            // shutdown only marks a turn it cut off.
             let pickup = match &request {
                 Some((_, harness_id))
                     if fresh
@@ -1627,10 +1640,13 @@ impl SessionsEngine {
     }
 
     /// Graceful shutdown: interrupt every live run so streaming entries settle.
-    /// A turn still working is marked first, so the next boot picks it back up
-    /// like a crashed one ([`Self::recover_stale`]). Not marked: a runtime the
-    /// user is already stopping (a Stop is never undone), a turn parked on a
-    /// question, a session parked between turns.
+    /// A turn still working is flagged first; the ones the shutdown then
+    /// actually cuts off are marked as they end, so the next boot picks them
+    /// back up like a crashed one ([`Self::recover_stale`]). Runs are stopped
+    /// one at a time, and a turn that finishes on its own meanwhile is not
+    /// marked. Not flagged: a runtime the user is already stopping (a Stop is
+    /// never undone), a turn parked on a question, a session parked between
+    /// turns.
     pub async fn shutdown(&self) {
         self.inner
             .shutting_down
@@ -1646,13 +1662,14 @@ impl SessionsEngine {
                 .filter(|session| session.status == SessionStatus::Working)
                 .map(|session| session.chat_id.clone())
                 .collect();
-            let at = now_ms();
+            let runs = lock(&self.inner.runs);
             for chat_id in working {
-                let live = lock(&self.inner.runs)
+                if let Some(run) = runs
                     .get(&chat_id)
-                    .is_some_and(|h| !h.retiring.load(std::sync::atomic::Ordering::Acquire));
-                if live {
-                    self.inner.journal.note_shutdown_interrupt(&chat_id, at);
+                    .filter(|h| !h.retiring.load(std::sync::atomic::Ordering::Acquire))
+                {
+                    run.shutdown_cut
+                        .store(true, std::sync::atomic::Ordering::Release);
                 }
             }
         }
@@ -2241,6 +2258,41 @@ impl Inner {
             }
         }
         done_id.map(|id| (id, String::new(), None))
+    }
+
+    /// Whether the engine's shutdown is what ends `run_id`'s turn: it was
+    /// working when the shutdown began and no Stop has claimed it since (see
+    /// [`SessionsEngine::shutdown`]). Marks the chat for the next boot if so
+    /// — here, as the turn ends, so one that finished on its own while the
+    /// shutdown was busy elsewhere is never picked back up.
+    fn mark_shutdown_cut(&self, chat_id: &str, run_id: &str) -> bool {
+        let cut = self
+            .shutting_down
+            .load(std::sync::atomic::Ordering::Acquire)
+            && lock(&self.runs).get(chat_id).is_some_and(|h| {
+                h.run_id == run_id && h.shutdown_cut.load(std::sync::atomic::Ordering::Acquire)
+            });
+        if cut {
+            self.journal.note_shutdown_interrupt(chat_id, now_ms());
+        }
+        cut
+    }
+
+    /// Whether the last turn journaled for `chat_id` is one the shutdown cut
+    /// off: its last `Done` carries [`SHUTDOWN_NOTE`].
+    fn ended_by_shutdown(&self, chat_id: &str) -> bool {
+        let Ok(events) = self.journal.events_rev(chat_id) else {
+            return false;
+        };
+        events
+            .map_while(Result::ok)
+            .find_map(|(_, event)| match event {
+                AgentEvent::Done { status, error, .. } => Some((status, error)),
+                _ => None,
+            })
+            .is_some_and(|(status, error)| {
+                status == DoneStatus::Interrupted && error.as_deref() == Some(SHUTDOWN_NOTE)
+            })
     }
 
     /// Withdraw `chat_id`'s pending revival of `message_id`, if still unclaimed.
@@ -3287,6 +3339,8 @@ async fn drive_run(
             if !ours {
                 return;
             }
+            // A shutdown during the wait cut this turn off before it began.
+            let cut = stopped && inner.mark_shutdown_cut(&chat_id, &run_id);
             inner.remove_run(&chat_id, &run_id);
             if stopped {
                 inner.publish(
@@ -3294,7 +3348,7 @@ async fn drive_run(
                     &AgentEvent::Done {
                         status: DoneStatus::Interrupted,
                         result: None,
-                        error: None,
+                        error: cut.then(|| SHUTDOWN_NOTE.into()),
                         session_id: None,
                     },
                 );
@@ -4172,20 +4226,16 @@ async fn drive_run(
             return;
         }
 
-        // A turn the engine's own shutdown cut off says so in its entry; the
-        // next boot picks it back up (see `SessionsEngine::shutdown`).
+        // A turn the engine's own shutdown cut off says so in its entry, and
+        // is marked here for the next boot to pick back up (see
+        // `SessionsEngine::shutdown`).
         let event = match event {
             AgentEvent::Done {
                 status: DoneStatus::Interrupted,
                 result,
                 error: None,
                 session_id,
-            } if interrupted
-                && turn_was_active
-                && inner
-                    .shutting_down
-                    .load(std::sync::atomic::Ordering::Acquire) =>
-            {
+            } if interrupted && turn_was_active && inner.mark_shutdown_cut(&chat_id, &run_id) => {
                 AgentEvent::Done {
                     status: DoneStatus::Interrupted,
                     result,
