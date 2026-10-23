@@ -482,11 +482,20 @@ impl ClaudeHarness {
                 "request_id": PROBE_ID,
                 "request": { "subtype": "initialize" },
             });
-            stdin
-                .write_all(format!("{request}\n").as_bytes())
-                .await
-                .map_err(HarnessError::Io)?;
-            stdin.flush().await.map_err(HarnessError::Io)?;
+            // A CLI that fails on startup may exit before reading: the write
+            // then fails (EPIPE), and that is the same exit before answering
+            // — read on to its stdout's end and report its status and stderr.
+            let sent = match stdin.write_all(format!("{request}\n").as_bytes()).await {
+                Ok(()) => stdin.flush().await,
+                Err(error) => Err(error),
+            };
+            if let Err(error) = sent {
+                tracing::debug!(
+                    target: "zeron_harness::claude",
+                    %error,
+                    "initialize request not delivered to the discovery probe"
+                );
+            }
             let mut lines = crate::lossy_lines::lossy_lines(stdout);
             while let Some(line) = lines.next_line().await.map_err(HarnessError::Io)? {
                 let Ok(frame) = serde_json::from_str::<Value>(&line) else {
