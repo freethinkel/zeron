@@ -3418,24 +3418,29 @@ fn restore_method(init: &Value, harness: HarnessId) -> &'static str {
     }
 }
 
-/// Whether a failed restore means the agent has no such session to give
-/// back, so starting fresh loses nothing that a retry would recover: it said
-/// the session is missing (Grok: "Path not found." for its session file;
-/// Devin: "Session not found"; ACP's resource-not-found code), or it cannot
-/// restore at all (method not found). Anything else — the load timing out,
-/// the agent exiting or its pipe closing before an answer, any other refusal
-/// — keeps the session for the next message.
-fn session_unrestorable(error: &HarnessError) -> bool {
+/// Whether a failed restore means the agent no longer has the session, so
+/// starting fresh loses nothing a retry would recover: ACP's
+/// resource-not-found code, no restore method at all, or a message that
+/// names the session as missing ("Session not found" from Devin). A bare
+/// "not found" is not enough: a missing MCP server command or model fails
+/// a load in the same words while the session is fine. Grok is the one
+/// exception: for an unknown session its only answer is a generic
+/// "Path not found." (FS_NOT_FOUND, verified on 1.0.46), and a missing
+/// working directory cannot be the cause there — the agent was started in
+/// it. Anything else — the load timing out, the agent exiting or its pipe
+/// closing before an answer, any other refusal — keeps the session for the
+/// next message.
+fn session_unrestorable(harness: HarnessId, error: &HarnessError) -> bool {
     let HarnessError::Protocol(message) = error else {
         return false;
     };
     let message = message.to_ascii_lowercase();
-    ["(code -32002)", "(code -32601)"]
-        .iter()
-        .any(|code| message.contains(code))
-        || ["not found", "unknown session", "no such session"]
-            .iter()
-            .any(|missing| message.contains(missing))
+    let says = |needles: &[&str]| needles.iter().any(|needle| message.contains(needle));
+    says(&["(code -32002)", "(code -32601)"])
+        || says(&["session not found", "unknown session", "no such session"])
+        || (harness == HarnessId::Grok
+            && message.contains("path not found")
+            && message.contains("fs_not_found"))
 }
 
 /// `session/new`, or for a resumed run the advertised restore with a visible
@@ -3482,7 +3487,7 @@ async fn open_session(
             Err(e) if is_auth_required(&e) => return Err(e),
             // A slow or interrupted restore is retried by the next message;
             // starting fresh would replace the stored session for good.
-            Err(e) if !session_unrestorable(&e) => {
+            Err(e) if !session_unrestorable(harness, &e) => {
                 return Err(HarnessError::Protocol(format!(
                     "{agent_name} could not restore session {resume}; the next message tries again: {e}"
                 )));
@@ -6086,15 +6091,25 @@ mod tests {
     #[test]
     fn only_a_missing_session_is_unrestorable() {
         let error = |message: &str| HarnessError::Protocol(format!("session/load: {message}"));
+        // Grok 1.0.46's answer for an unknown session id.
+        let grok_missing = r#"Path not found. (code -32603): {"detail":"No such file or directory (os error 2)","code":"FS_NOT_FOUND"}"#;
+        assert!(session_unrestorable(HarnessId::Grok, &error(grok_missing)));
+        // From another agent the same words say nothing about the session.
+        assert!(!session_unrestorable(
+            HarnessId::Devin,
+            &error(grok_missing)
+        ));
         for missing in [
-            // Grok 1.0.46, Devin 3000.11 for an unknown session id.
-            r#"Path not found. (code -32603): {"code":"FS_NOT_FOUND"}"#,
+            // Devin 3000.11 for an unknown session id.
             r#"Session not found (code -32016): {"cognition.ai/errorKind":"session_not_found"}"#,
             "Resource not found (code -32002)",
             "Method not found (code -32601)",
             "unknown session (code -32602)",
         ] {
-            assert!(session_unrestorable(&error(missing)), "{missing}");
+            assert!(
+                session_unrestorable(HarnessId::Devin, &error(missing)),
+                "{missing}"
+            );
         }
         for kept in [
             "the history replay did not finish within 90s",
@@ -6103,8 +6118,14 @@ mod tests {
             "agent exited during setup",
             "session store is locked (code -32603)",
             "Invalid params (code -32602)",
+            // A load fails in these words while the session is fine.
+            "MCP server command not found: zeron (code -32603)",
+            "model not found: grok-9 (code -32603)",
+            "Path not found. (code -32603)",
         ] {
-            assert!(!session_unrestorable(&error(kept)), "{kept}");
+            for harness in [HarnessId::Grok, HarnessId::Devin, HarnessId::Hermes] {
+                assert!(!session_unrestorable(harness, &error(kept)), "{kept}");
+            }
         }
     }
 
