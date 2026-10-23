@@ -360,7 +360,6 @@ impl Engine {
         let mut auth_state = engine.auth.watch_state();
         let mut assembly = engine.state();
         let synced = engine.workspace_scope == WorkspaceScope::Synced;
-        let mut signed_out = false;
         let outcome = tokio::select! {
             result = crate::shutdown_signal() => result.map_err(anyhow::Error::from),
             _ = stop_rx.recv() => {
@@ -369,7 +368,6 @@ impl Engine {
             }
             _ = crate::wait_for_signed_out(&mut auth_state), if synced => {
                 tracing::info!("signed out; stopping the synced background engine");
-                signed_out = true;
                 // A brief reply window for the SignOut RPC itself.
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 Ok(())
@@ -382,6 +380,9 @@ impl Engine {
             } => Err(anyhow::anyhow!("engine assembly failed: {failure}")),
         };
         tracing::info!("background engine shutting down");
+        // The app signs out, then stops the engine: the StopEngine may land
+        // before the auth watcher does, so the state decides, not the branch.
+        let signed_out = crate::forgoes_revival(engine.workspace_scope, &engine.auth.state());
         server.abort();
         boot.abort();
         // Before the data dir is released (with the runtime): no refresh may
@@ -391,7 +392,6 @@ impl Engine {
         let runtime = engine.runtime.lock().await.take();
         if let Some(runtime) = runtime {
             if signed_out {
-                // Sign-out ends the user's turns; none restart on next sign-in.
                 runtime.core().sessions.forgo_revival();
             }
             runtime.shutdown().await;
