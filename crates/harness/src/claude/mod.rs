@@ -381,11 +381,8 @@ impl ClaudeHarness {
         let mut child = Self::build_command(exe, request, title_only)
             .spawn()
             .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    HarnessError::NotInstalled(crate::executable::binary_hint(exe))
-                } else {
-                    HarnessError::Io(e)
-                }
+                let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
+                crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
             })?;
         let stdin = child.stdin.take();
         let stdout = child.stdout.take();
@@ -462,11 +459,7 @@ impl ClaudeHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
-            } else {
-                HarnessError::Io(e)
-            }
+            crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(&exe))
         })?;
         let stdio = (child.stdin.take(), child.stdout.take());
         let stderr_tail = crate::StderrTail::default();

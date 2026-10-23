@@ -106,6 +106,31 @@ pub(crate) fn binary_hint(path: &Path) -> String {
     )
 }
 
+/// What a failed agent launch reports. A working directory that is gone
+/// fails the spawn with `NotFound` on Unix too, which must not read as a
+/// missing binary; `binary` names the binary when it really is missing.
+/// Everything else stays [`HarnessError::Io`], kind intact (the engine
+/// retries the transient kinds).
+pub(crate) fn spawn_error(
+    error: std::io::Error,
+    cwd: Option<&Path>,
+    binary: impl FnOnce() -> String,
+) -> crate::HarnessError {
+    if let Some(cwd) = cwd
+        && matches!(cwd.try_exists(), Ok(false))
+    {
+        return crate::HarnessError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotADirectory,
+            format!("working directory {} does not exist", cwd.display()),
+        ));
+    }
+    if error.kind() == std::io::ErrorKind::NotFound {
+        crate::HarnessError::NotInstalled(binary())
+    } else {
+        crate::HarnessError::Io(error)
+    }
+}
+
 fn runnable(path: &Path) -> bool {
     #[cfg(unix)]
     {
@@ -704,6 +729,36 @@ pub(crate) fn find_on_paths_matching_with(
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_missing_working_directory_is_not_a_missing_binary() {
+        let tmp = tempfile::tempdir().unwrap();
+        let gone = tmp.path().join("deleted-project");
+        let not_found = || std::io::Error::from(std::io::ErrorKind::NotFound);
+        match spawn_error(not_found(), Some(&gone), || "claude".into()) {
+            crate::HarnessError::Io(error) => {
+                assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+                assert_eq!(
+                    error.to_string(),
+                    format!("working directory {} does not exist", gone.display())
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            spawn_error(not_found(), Some(tmp.path()), || "claude".into()),
+            crate::HarnessError::NotInstalled(hint) if hint == "claude"
+        ));
+        assert!(matches!(
+            spawn_error(not_found(), None, || "claude".into()),
+            crate::HarnessError::NotInstalled(_)
+        ));
+        let busy = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            spawn_error(busy, Some(tmp.path()), || unreachable!()),
+            crate::HarnessError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+    }
 
     #[test]
     fn semantic_versions_support_cli_labels_and_prereleases() {

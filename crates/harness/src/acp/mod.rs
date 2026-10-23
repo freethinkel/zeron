@@ -1418,11 +1418,9 @@ impl AcpHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
-            } else {
-                HarnessError::Io(e)
-            }
+            let home = std::env::var_os("HOME");
+            let cwd = home.as_deref().map(std::path::Path::new);
+            crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(&exe))
         })?;
         let on_progress = std::sync::Arc::new(on_progress);
         let announced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1750,11 +1748,8 @@ impl AcpHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
-            } else {
-                HarnessError::Io(e)
-            }
+            let cwd = cwd.filter(|c| !c.is_empty()).map(std::path::Path::new);
+            crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(&exe))
         })?;
         let mut child = Child::new(child);
         let stderr_tail = crate::StderrTail::default();

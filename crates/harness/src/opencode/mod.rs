@@ -822,11 +822,10 @@ impl Server {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            fatal(if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(exe))
-            } else {
-                HarnessError::Io(e)
-            })
+            let cwd = cwd.map(std::path::Path::new);
+            fatal(crate::executable::spawn_error(e, cwd, || {
+                crate::executable::binary_hint(exe)
+            }))
         })?;
         let stderr_tail = crate::StderrTail::default();
         // Matched per line: the tail keeps only the last few, and Node prints

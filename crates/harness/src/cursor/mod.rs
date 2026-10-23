@@ -390,11 +390,8 @@ impl Harness for CursorHarness {
             .stderr(Stdio::piped())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(exe.display().to_string())
-            } else {
-                HarnessError::Io(e)
-            }
+            let cwd = (!request.cwd.is_empty()).then(|| std::path::Path::new(&request.cwd));
+            crate::executable::spawn_error(e, cwd, || exe.display().to_string())
         })?;
 
         let stdin = child

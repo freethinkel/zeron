@@ -540,6 +540,31 @@ async fn missing_binary_is_not_installed() {
 }
 
 #[tokio::test]
+async fn missing_working_directory_is_not_a_missing_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let gone = tmp.path().join("deleted-project");
+    let (controls, _steer, _token) = controls("A");
+    let err = harness()
+        .run(
+            RunRequest {
+                cwd: gone.to_string_lossy().into_owned(),
+                ..request("scenario:happy")
+            },
+            controls,
+        )
+        .await
+        .err()
+        .expect("spawn fails");
+    match err {
+        HarnessError::Io(error) => {
+            assert_eq!(error.kind(), std::io::ErrorKind::NotADirectory);
+            assert!(error.to_string().contains("does not exist"), "{error}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[tokio::test]
 async fn captured_live_background_subagent_frames_replay_correctly() {
     // Frames captured VERBATIM from claude 2.1.228 (2026-08-17): a turn that
     // spawns a background Agent subagent — eager result while it runs, tagged

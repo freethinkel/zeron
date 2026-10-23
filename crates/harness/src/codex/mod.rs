@@ -223,11 +223,7 @@ impl CodexHarness {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
-            } else {
-                HarnessError::Io(e)
-            }
+            crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(&exe))
         })?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             shutdown_child(&mut child, self.kill_grace).await;
@@ -280,11 +276,7 @@ impl CodexHarness {
             .stderr(Stdio::null())
             .kill_on_drop(true);
         let mut child = cmd.spawn().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                HarnessError::NotInstalled(crate::executable::binary_hint(&exe))
-            } else {
-                HarnessError::Io(e)
-            }
+            crate::executable::spawn_error(e, None, || crate::executable::binary_hint(&exe))
         })?;
         let (Some(stdin), Some(stdout)) = (child.stdin.take(), child.stdout.take()) else {
             shutdown_child(&mut child, self.kill_grace).await;
@@ -851,11 +843,8 @@ fn spawn_app_server(exe: &Path, request: &RunRequest) -> Result<AppServer, Harne
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     let mut child = cmd.spawn().map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            HarnessError::NotInstalled(crate::executable::binary_hint(exe))
-        } else {
-            HarnessError::Io(e)
-        }
+        let cwd = (!request.cwd.is_empty()).then(|| Path::new(&request.cwd));
+        crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(exe))
     })?;
     let stdin = child
         .stdin

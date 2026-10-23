@@ -152,7 +152,10 @@ impl PiHarness {
         let scratch = mcp
             .map(|config| self::mcp::configure(&mut cmd, config))
             .transpose()?;
-        let mut child = Child::new(cmd.spawn()?);
+        let child = cmd.spawn().map_err(|e| {
+            crate::executable::spawn_error(e, Some(cwd), || crate::executable::binary_hint(&exe))
+        })?;
+        let mut child = Child::new(child);
         let tail = crate::StderrTail::default();
         let mut lines = crate::lossy_lines::lossy_lines(child.stderr.take().expect("piped stderr"));
         let stderr = tail.clone();
