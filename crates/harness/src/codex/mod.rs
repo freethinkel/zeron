@@ -985,11 +985,32 @@ fn resume_unrecoverable(error: &HarnessError) -> Option<&'static str> {
     ]) {
         Some("it isn't saved on this device")
     } else if says(&["failed to read thread", "rollout at"]) {
-        Some(if message.contains("is empty") {
-            "its saved history is empty"
+        // Only a history that is empty or unreadable as data is gone. One
+        // the OS would not hand over (permissions, a lock, a busy disk) is
+        // still there for the next message.
+        if says(&[
+            "os error",
+            "permission denied",
+            "locked",
+            "busy",
+            "too many open files",
+            "timed out",
+        ]) {
+            None
+        } else if message.contains("is empty") {
+            Some("its saved history is empty")
+        } else if says(&[
+            "valid utf-8",
+            "failed to parse",
+            "parse error",
+            "expected value",
+            "eof while parsing",
+            "invalid json",
+        ]) {
+            Some("its saved history couldn't be read")
         } else {
-            "its saved history couldn't be read"
-        })
+            None
+        }
     } else if says(&["invalid session id", "invalid thread id"]) {
         Some("Codex doesn't recognize its id")
     } else {
@@ -2879,6 +2900,11 @@ mod tests {
             "thread/resume: failed to open /repo/AGENTS.md: entity not found (code -32603)",
             "thread/resume: environment variable not found: MY_PROVIDER_KEY (code -32603)",
             "thread/resume: model provider `corp` not found (code -32600)",
+            // A rollout the OS would not hand over still exists.
+            "thread/resume: failed to read thread: thread-store internal error: failed to read session metadata /h/sessions/2026/10/23/rollout-x.jsonl: Permission denied (os error 13) (code -32603)",
+            "thread/resume: failed to read thread: thread-store internal error: rollout at /h/sessions/2026/10/23/rollout-x.jsonl is locked (code -32603)",
+            "thread/resume: failed to read thread: thread-store internal error: Too many open files (os error 24) (code -32603)",
+            "thread/resume: failed to read thread: thread-store internal error: something new (code -32603)",
         ] {
             assert_eq!(resume_unrecoverable(&protocol(keep)), None, "{keep}");
         }
