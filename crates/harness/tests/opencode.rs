@@ -1446,8 +1446,13 @@ async fn live_turns_against_a_real_opencode() {
     let root = tempfile::tempdir().unwrap();
     let project = root.path().join("project dir");
     std::fs::create_dir_all(&project).unwrap();
-    // A 1x1 PNG under a name `file://{path}` used to mangle.
-    let shot = project.join("shot #1 ?%.png");
+    // A 1x1 PNG under a name `file://{path}` used to mangle (Windows file
+    // names cannot hold `?`).
+    let shot = project.join(if cfg!(windows) {
+        "shot #1 %.png"
+    } else {
+        "shot #1 ?%.png"
+    });
     std::fs::write(
         &shot,
         [
