@@ -49,6 +49,80 @@ fn parked_child_helper() {
     }
 }
 
+#[test]
+fn stdin_eof_helper() {
+    if let Some(marker) = std::env::var_os("ZERON_TEST_STDIN_EOF_MARKER") {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        std::fs::write(marker, "eof").unwrap();
+    }
+}
+fn eof_command(marker: &std::path::Path) -> Command {
+    let mut command = Command::new(std::env::current_exe().unwrap());
+    command
+        .args(["--exact", "process::windows::tests::stdin_eof_helper"])
+        .env("ZERON_TEST_STDIN_EOF_MARKER", marker)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command
+}
+
+/// The teardown's grace is for an agent about to exit on stdin EOF. A child
+/// with no stdin pipe, or whose stdin is still held, is terminated at once
+/// (`opencode serve` reads no stdin and would otherwise cost every stop the
+/// whole grace); one whose handed-off stdin closes gets to exit on its own.
+#[tokio::test]
+async fn teardown_waits_on_stdin_eof_only_when_one_is_coming() {
+    let grace = Duration::from_secs(20);
+    let mut parked = parked_command();
+    parked.env("ZERON_TEST_PARKED_CHILD", "1");
+    let mut child = parked.spawn().unwrap();
+    let started = Instant::now();
+    crate::shutdown_child(&mut child, grace).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "no stdin pipe: no wait"
+    );
+
+    let dir = tempfile::tempdir().unwrap();
+    let held_marker = dir.path().join("held");
+    let mut child = eof_command(&held_marker).spawn().unwrap();
+    let held = child.stdin.take();
+    let started = Instant::now();
+    crate::shutdown_child(&mut child, grace).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "stdin still held: no wait"
+    );
+    assert!(!held_marker.exists());
+    drop(held);
+
+    let closed_marker = dir.path().join("closed");
+    let mut child = eof_command(&closed_marker).spawn().unwrap();
+    let stdin = child.stdin.take().unwrap();
+    // A writer task drops it just after the teardown starts, as drivers do.
+    let writer = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        drop(stdin);
+    });
+    crate::shutdown_child(&mut child, grace).await;
+    writer.await.unwrap();
+    assert!(
+        closed_marker.exists(),
+        "the child exits on its own after EOF"
+    );
+
+    let ignored_marker = dir.path().join("ignored");
+    let mut child = eof_command(&ignored_marker).spawn().unwrap();
+    child.ignore_stdin_eof();
+    let started = Instant::now();
+    crate::shutdown_child(&mut child, grace).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "ignores EOF: no wait"
+    );
+}
+
 #[tokio::test]
 async fn unrelated_inheritable_handles_are_not_passed_to_agents() {
     use windows_sys::Win32::Security::SECURITY_ATTRIBUTES;

@@ -216,6 +216,15 @@ fn grok_install_paths() -> Vec<PathBuf> {
     dirs
 }
 
+/// Whether the agent exits promptly once its stdin closes, which Windows'
+/// teardown waits for (see [`crate::shutdown_child`]). Measured against the
+/// installed CLIs: Hermes keeps running after EOF, and Grok takes over 2s
+/// to go (on SIGTERM it takes a fifth of a second); Devin exits within a
+/// quarter second.
+fn exits_on_stdin_eof(id: HarnessId) -> bool {
+    !matches!(id, HarnessId::Grok | HarnessId::Hermes)
+}
+
 fn grok_spec() -> AcpAgentSpec {
     AcpAgentSpec {
         id: HarnessId::Grok,
@@ -1429,6 +1438,9 @@ impl AcpHarness {
             let cwd = home.as_deref().map(std::path::Path::new);
             crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(&exe))
         })?;
+        if !exits_on_stdin_eof(self.spec.id) {
+            crate::process::ignores_stdin_eof(&mut child);
+        }
         let on_progress = std::sync::Arc::new(on_progress);
         let announced = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         if let Some(stderr) = child.stderr.take() {
@@ -1760,6 +1772,9 @@ impl AcpHarness {
             crate::executable::spawn_error(e, cwd, || crate::executable::binary_hint(&exe))
         })?;
         let mut child = Child::new(child);
+        if !exits_on_stdin_eof(self.spec.id) {
+            crate::process::ignores_stdin_eof(&mut child);
+        }
         let stderr_tail = crate::StderrTail::default();
         let sign_in_prompted = CancellationToken::new();
         if let Some(stderr) = child.stderr.take() {

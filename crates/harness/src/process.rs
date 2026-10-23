@@ -32,6 +32,16 @@ fn spawn_retryable(error: &std::io::Error, image_age: Option<std::time::Duration
     }
 }
 
+/// Mark an agent that does not exit promptly on stdin EOF: Windows' teardown
+/// then terminates it rather than waiting out a grace for an exit that will
+/// not come. Unix teardown signals instead; nothing changes there.
+pub(crate) fn ignores_stdin_eof(child: &mut Child) {
+    #[cfg(windows)]
+    child.ignore_stdin_eof();
+    #[cfg(not(windows))]
+    let _ = child;
+}
+
 #[cfg(unix)]
 pub(crate) fn signal_target(child: &Child) -> Option<i32> {
     let pid = child.id()? as i32;

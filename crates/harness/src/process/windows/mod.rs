@@ -8,8 +8,43 @@ mod stdio;
 mod tests;
 pub use command::Command;
 pub use stdio::Stdio;
-pub type ChildStdin = tokio::fs::File;
 pub type ChildStdout = tokio::fs::File;
+
+/// The parent's end of a child's stdin pipe. Dropping it is the EOF an agent
+/// waiting on its input exits on; the [`Child`] learns of that through
+/// `_open` (its receiver sees the sender go).
+#[derive(Debug)]
+pub struct ChildStdin {
+    file: tokio::fs::File,
+    _open: tokio::sync::watch::Sender<()>,
+}
+
+impl tokio::io::AsyncWrite for ChildStdin {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<io::Result<usize>> {
+        std::pin::Pin::new(&mut self.get_mut().file).poll_write(cx, buf)
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().file).poll_flush(cx)
+    }
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<io::Result<()>> {
+        std::pin::Pin::new(&mut self.get_mut().file).poll_shutdown(cx)
+    }
+}
+
+/// How long a teardown waits for a stdin its driver handed to a writer task
+/// to actually close: the driver closes it just before the teardown, and the
+/// task drops it a moment later.
+const STDIN_CLOSE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
 use crate::windows_process::Job;
 use std::io;
@@ -36,6 +71,10 @@ pub struct Child {
     pub stdin: Option<ChildStdin>,
     pub stdout: Option<ChildStdout>,
     pub stderr: Option<tokio::fs::File>,
+    /// Open while the stdin pipe's [`ChildStdin`] lives; `None` without a pipe.
+    stdin_open: Option<tokio::sync::watch::Receiver<()>>,
+    /// The agent does not exit on stdin EOF (see [`Child::ignore_stdin_eof`]).
+    ignores_stdin_eof: bool,
 }
 impl Drop for Child {
     fn drop(&mut self) {
@@ -45,6 +84,32 @@ impl Drop for Child {
 impl Child {
     pub fn id(&self) -> Option<u32> {
         self.status.is_none().then_some(self.pid)
+    }
+    /// Mark an agent that does not exit promptly once its stdin closes, so a
+    /// teardown terminates it without waiting out a grace for nothing.
+    pub fn ignore_stdin_eof(&mut self) {
+        self.ignores_stdin_eof = true;
+    }
+    /// Whether a teardown's wait for this child to exit on stdin EOF can pay
+    /// off: it reads a pipe, the pipe is closed (or [`Self::wait`] closes it,
+    /// still holding it), and the agent exits on EOF. A stdin handed to a
+    /// writer task gets [`STDIN_CLOSE_WAIT`] to be dropped; one still held
+    /// elsewhere means no EOF is coming.
+    pub(crate) async fn stdin_eof_coming(&mut self) -> bool {
+        if self.ignores_stdin_eof {
+            return false;
+        }
+        if self.stdin.is_some() {
+            return true;
+        }
+        let Some(open) = &mut self.stdin_open else {
+            return false;
+        };
+        // Nothing is ever sent: `changed` ends only once the sender is gone.
+        matches!(
+            tokio::time::timeout(STDIN_CLOSE_WAIT, open.changed()).await,
+            Ok(Err(_))
+        )
     }
     pub fn start_kill(&mut self) -> io::Result<()> {
         self.job.terminate()
@@ -203,6 +268,13 @@ fn launch(
     let process = unsafe { OwnedHandle::from_raw_handle(info.hProcess) };
     let thread = unsafe { OwnedHandle::from_raw_handle(info.hThread) };
     let (done, exited) = tokio::sync::oneshot::channel();
+    let (stdin, stdin_open) = match stdin {
+        Some(file) => {
+            let (open, watched) = tokio::sync::watch::channel(());
+            (Some(ChildStdin { file, _open: open }), Some(watched))
+        }
+        None => (None, None),
+    };
     let child = Child {
         process,
         pid: info.dwProcessId,
@@ -213,6 +285,8 @@ fn launch(
         stdin,
         stdout,
         stderr,
+        stdin_open,
+        ignores_stdin_eof: false,
     };
     child.escrow.release(&handles)?;
     after_create(&child)?;

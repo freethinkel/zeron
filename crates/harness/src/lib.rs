@@ -624,14 +624,16 @@ pub(crate) async fn shutdown_agent(
 }
 
 /// Reap the child: Unix sends SIGTERM then SIGKILL after `kill_grace`.
-/// Windows has no SIGTERM for a windowless child: its stdin is closed and it
-/// gets `kill_grace` to exit on its own (callers have already sent their
-/// protocol shutdown), so an agent is not killed mid-write to its session
-/// files; then the owned job is terminated, descendants included.
+/// Windows has no SIGTERM for a windowless child: when its stdin pipe is (or
+/// is now) closed and it exits on that EOF, it gets `kill_grace` to exit on
+/// its own (callers have already sent their protocol shutdown), so an agent
+/// is not killed mid-write to its session files. Then the owned job is
+/// terminated, descendants included — at once for a child with no stdin
+/// pipe, one whose stdin is still held elsewhere, or one that ignores EOF.
 pub(crate) async fn shutdown_child(child: &mut process::Child, kill_grace: std::time::Duration) {
     #[cfg(windows)]
     {
-        if !matches!(child.try_wait(), Ok(Some(_))) {
+        if !matches!(child.try_wait(), Ok(Some(_))) && child.stdin_eof_coming().await {
             // wait() drops the child's stdin first: EOF is the cue to exit.
             let _ = tokio::time::timeout(kill_grace, child.wait()).await;
         }
