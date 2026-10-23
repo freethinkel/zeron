@@ -1644,7 +1644,8 @@ async fn unknown_control_requests_are_answered() {
 }
 
 /// A model switch the CLI refused is shown, and not taken as applied: the
-/// next prompt with the same configuration asks again.
+/// next prompt with the same configuration asks again. Refused again the
+/// same way, it is not shown a second time.
 #[tokio::test]
 async fn a_refused_model_switch_is_shown_and_retried() {
     let (controls, steer, _token) = controls("A");
@@ -1692,6 +1693,12 @@ async fn a_refused_model_switch_is_shown_and_retried() {
     .await
     .expect("run finished in time");
     assert_eq!(done(&rest).1.as_deref(), Some("third"), "{rest:?}");
+    assert!(
+        !rest.iter().any(
+            |e| matches!(e, AgentEvent::Error { message } if message.contains("could not change"))
+        ),
+        "{rest:?}"
+    );
 }
 
 /// What the CLI started (MCP servers, tools) goes with it when it exits on

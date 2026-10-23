@@ -1092,15 +1092,20 @@ async fn run_session(session: Session) {
     let mut restore_fallback = launched.resume.is_some();
     let mut relaunch = false;
     // Our configuration requests the CLI has not answered yet (`set_model`,
-    // `apply_flag_settings`), and when we stop waiting for each.
+    // `apply_flag_settings`): what each asked for, and when we stop waiting.
     const CONTROL_TIMEOUT: Duration = Duration::from_secs(30);
     let mut pending_controls: std::collections::HashMap<
         String,
-        (&'static str, tokio::time::Instant),
+        (&'static str, Value, tokio::time::Instant),
     > = std::collections::HashMap::new();
     // A configuration request failed or went unanswered: the live process
     // may not run what `config` says, so the next change re-sends it all.
     let mut config_unsure = false;
+    // What the CLI last refused, per request kind. Every message carrying
+    // the same configuration asks again; its refusal was already shown, and
+    // is shown again only once the ask changes or has succeeded.
+    let mut refused: std::collections::HashMap<&'static str, Value> =
+        std::collections::HashMap::new();
     // A turn stop in flight (`TurnControl::stop_turn`): its request id, and
     // once the CLI has answered, how long a turn-ending `result` may still
     // take. The CLI answers a stop between turns without any result — the
@@ -1178,7 +1183,7 @@ async fn run_session(session: Session) {
                 break 'main;
             }
         }
-        let control_deadline = pending_controls.values().map(|(_, at)| *at).min();
+        let control_deadline = pending_controls.values().map(|(_, _, at)| *at).min();
         tokio::select! {
             line = stdout_lines.next_line() => match line {
                 Ok(Some(line)) => {
@@ -1220,13 +1225,18 @@ async fn run_session(session: Session) {
                             stop_settle_at = Some(tokio::time::Instant::now() + STOP_SETTLE);
                         }
                         let error = response.error_message();
-                        if let Some((what, _)) = pending_controls.remove(&response.request_id)
-                            && let Some(error) = &error
-                        {
-                            config_unsure = true;
-                            if event_tx.send(Ok(AgentEvent::Error {
-                                message: format!("Claude could not change its {what}: {error}"),
-                            })).await.is_err() { break 'main; }
+                        if let Some((what, asked, _)) = pending_controls.remove(&response.request_id) {
+                            if let Some(error) = &error {
+                                config_unsure = true;
+                                if refused.get(what) != Some(&asked) {
+                                    refused.insert(what, asked);
+                                    if event_tx.send(Ok(AgentEvent::Error {
+                                        message: format!("Claude could not change its {what}: {error}"),
+                                    })).await.is_err() { break 'main; }
+                                }
+                            } else {
+                                refused.remove(what);
+                            }
                         } else if let Some(error) = error {
                             tracing::warn!(
                                 target: "zeron_harness::claude",
@@ -1412,14 +1422,16 @@ async fn run_session(session: Session) {
                         let deadline = tokio::time::Instant::now() + CONTROL_TIMEOUT;
                         if resend || model_arg(&next) != model_arg(&config) {
                             let id = format!("zeron_model_{reconfigures}");
-                            let line = wire::set_model_request_line(&id, model_arg(&next).as_deref());
-                            pending_controls.insert(id, ("model", deadline));
+                            let model = model_arg(&next);
+                            let line = wire::set_model_request_line(&id, model.as_deref());
+                            pending_controls.insert(id, ("model", Value::from(model), deadline));
                             if !stdin.line(line) { break 'main; }
                         }
                         if resend || flag_settings(&next) != flag_settings(&config) {
                             let id = format!("zeron_settings_{reconfigures}");
-                            let line = wire::apply_flag_settings_line(&id, flag_settings(&next));
-                            pending_controls.insert(id, ("settings", deadline));
+                            let settings = flag_settings(&next);
+                            let line = wire::apply_flag_settings_line(&id, settings.clone());
+                            pending_controls.insert(id, ("settings", settings, deadline));
                             if !stdin.line(line) { break 'main; }
                         }
                         config = *next;
@@ -1542,7 +1554,7 @@ async fn run_session(session: Session) {
             _ = tokio::time::sleep_until(control_deadline.unwrap_or_else(tokio::time::Instant::now)),
                 if control_deadline.is_some() => {
                 let now = tokio::time::Instant::now();
-                pending_controls.retain(|id, (_, at)| {
+                pending_controls.retain(|id, (_, _, at)| {
                     let waiting = *at > now;
                     if !waiting {
                         tracing::warn!(target: "zeron_harness::claude", request = %id, "control request unanswered");

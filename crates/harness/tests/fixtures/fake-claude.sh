@@ -456,10 +456,16 @@ case "$first" in
   read -r prompt || exit 1
   emit "$prompt"
   emit '{"type":"result","subtype":"success","result":"second","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-smf"}'
-  # The same configuration again: the failed switch is re-sent.
+  # The same configuration again: the failed switch is re-sent, and refused
+  # the same way.
   read -r retry || exit 1
   case "$retry" in *'"subtype":"set_model"'*) ;; *) exit 17 ;; esac
-  read -r again || exit 1
+  rid=$(printf '%s\n' "$retry" | sed 's/.*"request_id":"\([^"]*\)".*/\1/')
+  emit "{\"type\":\"control_response\",\"response\":{\"subtype\":\"error\",\"request_id\":\"$rid\",\"error\":\"Model not available\"}}"
+  # The rest of the configuration rides along before the prompt.
+  while read -r again; do
+    case "$again" in *'"type":"user"'*) break ;; esac
+  done
   emit "$again"
   emit '{"type":"result","subtype":"success","result":"third","usage":{"input_tokens":1,"output_tokens":1},"session_id":"sess-smf"}'
   ;;
