@@ -74,8 +74,8 @@ const ANTIGRAVITY_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(90);
 const CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 /// `session/load`'s own budget, on top of the handshake's: it replays the
 /// whole transcript, which on a long chat takes far longer than the rest of
-/// setup. Past it the run starts fresh (with a visible notice) rather than
-/// failing.
+/// setup. Past it the run errors and keeps the session for the next message:
+/// a slow load is no reason to give up the conversation's context.
 const SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(90);
 /// A stopped turn normally settles `cancelled` within moments. An agent still
 /// holding the prompt past this is wedged on the cancel (a tool that ignores
@@ -1263,6 +1263,8 @@ pub struct AcpHarness {
     /// How long a stopped turn may take to settle before the runtime is
     /// retired (see [`DEFAULT_STOP_TIMEOUT`]).
     stop_timeout: Duration,
+    /// `session/load`'s own budget (see [`SESSION_LOAD_TIMEOUT`]).
+    session_load_timeout: Duration,
     /// Bound on the initialize → session/new probe used to populate the model
     /// picker. OpenCode shares this with its real startup budget because both
     /// paths wait for the same plugin-heavy boot.
@@ -1288,6 +1290,7 @@ impl AcpHarness {
             // wedged agent, not a slow one.
             handshake_timeout: DEFAULT_HANDSHAKE_TIMEOUT,
             stop_timeout: DEFAULT_STOP_TIMEOUT,
+            session_load_timeout: SESSION_LOAD_TIMEOUT,
             model_discovery_timeout: DEFAULT_MODEL_DISCOVERY_TIMEOUT,
             commands: tokio::sync::OnceCell::new(),
             models_cache: crate::catalog::Catalog::default(),
@@ -1530,6 +1533,13 @@ impl AcpHarness {
     #[doc(hidden)]
     pub fn with_stop_timeout(mut self, timeout: Duration) -> Self {
         self.stop_timeout = timeout;
+        self
+    }
+
+    /// Tune the `session/load` bound (tests shrink it; default 90s).
+    #[doc(hidden)]
+    pub fn with_session_load_timeout(mut self, timeout: Duration) -> Self {
+        self.session_load_timeout = timeout;
         self
     }
 
@@ -2478,6 +2488,7 @@ impl Harness for AcpHarness {
             kill_grace: self.kill_grace,
             handshake_timeout: self.handshake_timeout,
             stop_timeout: self.stop_timeout,
+            session_load_timeout: self.session_load_timeout,
             stderr_tail,
             sign_in_prompted,
         }));
@@ -2529,6 +2540,7 @@ struct Session {
     kill_grace: Duration,
     handshake_timeout: Duration,
     stop_timeout: Duration,
+    session_load_timeout: Duration,
     stderr_tail: crate::StderrTail,
     sign_in_prompted: CancellationToken,
 }
@@ -3393,8 +3405,8 @@ fn windows_noop_browser(executable: &Path) -> Result<String, HarnessError> {
 /// transcript, `session/resume` only reattaches it. Each is used only when
 /// advertised; Antigravity prefers resume because its load replays every
 /// tool call, which on a long chat outlasts the handshake. An agent
-/// declaring neither still gets a load attempt — a refusal falls back to a
-/// fresh session like any failed restore.
+/// declaring neither still gets a load attempt — a method-not-found refusal
+/// falls back to a fresh session (see [`session_unrestorable`]).
 fn restore_method(init: &Value, harness: HarnessId) -> &'static str {
     let capabilities = &init["agentCapabilities"];
     let load = capabilities["loadSession"].as_bool() == Some(true);
@@ -3406,9 +3418,32 @@ fn restore_method(init: &Value, harness: HarnessId) -> &'static str {
     }
 }
 
+/// Whether a failed restore means the agent has no such session to give
+/// back, so starting fresh loses nothing that a retry would recover: it said
+/// the session is missing (Grok: "Path not found." for its session file;
+/// Devin: "Session not found"; ACP's resource-not-found code), or it cannot
+/// restore at all (method not found). Anything else — the load timing out,
+/// the agent exiting or its pipe closing before an answer, any other refusal
+/// — keeps the session for the next message.
+fn session_unrestorable(error: &HarnessError) -> bool {
+    let HarnessError::Protocol(message) = error else {
+        return false;
+    };
+    let message = message.to_ascii_lowercase();
+    ["(code -32002)", "(code -32601)"]
+        .iter()
+        .any(|code| message.contains(code))
+        || ["not found", "unknown session", "no such session"]
+            .iter()
+            .any(|missing| message.contains(missing))
+}
+
 /// `session/new`, or for a resumed run the advertised restore with a visible
-/// fallback to a fresh session. auth_required propagates so setup can sign
-/// in and retry.
+/// fallback to a fresh session when the agent no longer has it (see
+/// [`session_unrestorable`]); any other restore failure errors the run and
+/// keeps the session. auth_required propagates so setup can sign in and
+/// retry.
+#[allow(clippy::too_many_arguments)]
 async fn open_session(
     client: &RpcClient,
     incoming: &mut mpsc::Receiver<Incoming>,
@@ -3416,6 +3451,7 @@ async fn open_session(
     harness: HarnessId,
     request: &RunRequest,
     agent_name: &str,
+    load_timeout: Duration,
     event_tx: &mpsc::Sender<Result<AgentEvent, HarnessError>>,
 ) -> Result<(String, Value), HarnessError> {
     let params = json!({
@@ -3428,14 +3464,14 @@ async fn open_session(
         restore["sessionId"] = Value::String(resume.clone());
         let restored = if method == "session/load" {
             tokio::time::timeout(
-                SESSION_LOAD_TIMEOUT,
+                load_timeout,
                 request_draining(client, incoming, method, restore),
             )
             .await
             .unwrap_or_else(|_| {
                 Err(HarnessError::Protocol(format!(
                     "session/load: the history replay did not finish within {}s",
-                    SESSION_LOAD_TIMEOUT.as_secs()
+                    load_timeout.as_secs()
                 )))
             })
         } else {
@@ -3444,6 +3480,13 @@ async fn open_session(
         match restored {
             Ok(response) => return Ok((resume.clone(), response)),
             Err(e) if is_auth_required(&e) => return Err(e),
+            // A slow or interrupted restore is retried by the next message;
+            // starting fresh would replace the stored session for good.
+            Err(e) if !session_unrestorable(&e) => {
+                return Err(HarnessError::Protocol(format!(
+                    "{agent_name} could not restore session {resume}; the next message tries again: {e}"
+                )));
+            }
             // A missing/foreign session falls back to a fresh one.
             Err(e) => {
                 tracing::debug!(
@@ -4032,6 +4075,7 @@ async fn run_session(session: Session) {
         kill_grace,
         handshake_timeout,
         stop_timeout,
+        session_load_timeout,
         stderr_tail,
         sign_in_prompted,
     } = session;
@@ -4071,6 +4115,7 @@ async fn run_session(session: Session) {
                 harness,
                 &request,
                 agent_name,
+                session_load_timeout,
                 &event_tx,
             )
             .await
@@ -4120,7 +4165,7 @@ async fn run_session(session: Session) {
     let mut setup_exit = None;
     let mut setup_drain_deadline = None;
     let setup_budget = if request.resume.is_some() {
-        handshake_timeout + SESSION_LOAD_TIMEOUT
+        handshake_timeout + session_load_timeout
     } else {
         handshake_timeout
     };
@@ -4216,7 +4261,9 @@ async fn run_session(session: Session) {
                     status: DoneStatus::Errored,
                     result: None,
                     error: Some(error),
-                    session_id: None,
+                    // A resumed run that never got going still owns the
+                    // session it was restoring; the next message retries it.
+                    session_id: request.resume.clone(),
                 }))
                 .await;
             client.close_stdin_for_teardown();
@@ -6034,6 +6081,31 @@ mod tests {
             restore_method(&json!({}), HarnessId::Hermes),
             "session/load"
         );
+    }
+
+    #[test]
+    fn only_a_missing_session_is_unrestorable() {
+        let error = |message: &str| HarnessError::Protocol(format!("session/load: {message}"));
+        for missing in [
+            // Grok 1.0.46, Devin 3000.11 for an unknown session id.
+            r#"Path not found. (code -32603): {"code":"FS_NOT_FOUND"}"#,
+            r#"Session not found (code -32016): {"cognition.ai/errorKind":"session_not_found"}"#,
+            "Resource not found (code -32002)",
+            "Method not found (code -32601)",
+            "unknown session (code -32602)",
+        ] {
+            assert!(session_unrestorable(&error(missing)), "{missing}");
+        }
+        for kept in [
+            "the history replay did not finish within 90s",
+            "app-server exited before responding",
+            "app-server stdin closed: Broken pipe",
+            "agent exited during setup",
+            "session store is locked (code -32603)",
+            "Invalid params (code -32602)",
+        ] {
+            assert!(!session_unrestorable(&error(kept)), "{kept}");
+        }
     }
 
     #[test]
