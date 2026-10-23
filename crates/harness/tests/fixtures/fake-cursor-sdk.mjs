@@ -42,6 +42,11 @@ function instance(store) {
       store.logPrompt(prompt);
       // A send that never comes back, with no update ever.
       if(prompt==='silent-send') return new Promise(()=>{});
+      // Silent past the bound, then the send comes back and streams anyway.
+      if(prompt==='silent-late') return new Promise((resolve)=>setTimeout(()=>{
+        onDelta({update:{type:'text-delta',text:'late'}});
+        resolve({runId:'run-late',cancel:async()=>{},wait:()=>new Promise(()=>{})});
+      },600));
       if(model) store.logModel(prompt,model.id);
       const doc=await store.agents.get({});
       if(doc.activeRunId) throw new Error('Agent already has active run');

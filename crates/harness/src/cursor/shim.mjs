@@ -654,11 +654,16 @@ const SILENT = Symbol("silent");
 function silenceWatch() {
   let timer;
   let fire;
+  let abandoned = false;
   const silent = new Promise((resolve) => { fire = resolve; });
   return {
     silent,
     arm() { timer = setTimeout(fire, silenceTimeoutMs, SILENT); },
     heard() { clearTimeout(timer); },
+    // Once its turn is abandoned, nothing the send reports reaches the
+    // engine: the turn already ended.
+    abandon() { abandoned = true; },
+    get abandoned() { return abandoned; },
   };
 }
 // `{type, data, mimeType}` blocks from the engine → the SDK's image shape.
@@ -687,9 +692,12 @@ async function runTurn(prompt, ready, accepted, images = []) {
   }
 }
 
-// The send outlived the silence bound: abandon the turn with a clear error
-// (the engine retires this process; the next message resumes the agent).
-function abandonSilentTurn(pending) {
+// The send outlived the silence bound: abandon the turn with a clear error.
+// The process lives on: whatever the stuck send reports later is dropped
+// (see `silenceWatch`), and the next message starts a run of its own (a run
+// the SDK still holds active is expired then, see `sendTurn`).
+function abandonSilentTurn(watch, pending) {
+  watch.abandon();
   void pending?.then((late) => late?.cancel().catch(() => {}), () => {});
   if (run) run.cancel().catch(() => {});
   activeTools.clear();
@@ -731,6 +739,7 @@ async function sendTurn(prompt, ready, accepted, images, watch) {
       ...(local ? { local } : {}),
       onDelta: ({ update }) => {
         watch.heard();
+        if (watch.abandoned) return;
         if (thisRun && thisRun === preemptedRun) return;
         try {
           mapUpdate(update);
@@ -758,7 +767,7 @@ async function sendTurn(prompt, ready, accepted, images, watch) {
       run = thisRun = await sent({ force: true });
     }
   } catch (e) {
-    if (e?.silent) return abandonSilentTurn(e.silent);
+    if (e?.silent) return abandonSilentTurn(watch, e.silent);
     out({ ev: "turn", status: "error", error: withAuthHint(formatError(e, run?.requestId)) });
     run = null;
     turnActive = false;
@@ -771,7 +780,7 @@ async function sendTurn(prompt, ready, accepted, images, watch) {
   let result;
   try {
     result = await Promise.race([run.wait(), watch.silent]);
-    if (result === SILENT) return abandonSilentTurn();
+    if (result === SILENT) return abandonSilentTurn(watch);
   } catch (e) {
     if (preempting && !interrupted && !stopping && !closing) return continueAfterPreempt();
     const stopped = stopping;

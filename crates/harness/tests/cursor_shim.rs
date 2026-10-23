@@ -1055,6 +1055,22 @@ async fn a_send_with_no_update_at_all_is_abandoned_at_the_bound() {
     }
 }
 
+/// A send that comes back after its turn was abandoned is heard no more: the
+/// engine already has the turn's end, and the process stays usable.
+#[tokio::test]
+async fn an_abandoned_send_that_comes_back_late_stays_silent() {
+    let fixture = SessionFixture::new();
+    let (mut child, stdin, mut lines) = fixture
+        .start_frame("silent-late", serde_json::json!({"silenceTimeoutMs": 300}))
+        .await;
+    let frames = turn_frames(&mut lines).await;
+    assert_eq!(frames.last().unwrap()["status"], "error", "{frames:?}");
+    let late =
+        tokio::time::timeout(std::time::Duration::from_millis(1200), lines.next_line()).await;
+    assert!(late.is_err(), "output after the abandoned turn: {late:?}");
+    finish(&mut child, stdin).await;
+}
+
 /// Updates keep a turn alive past the bound: only total silence trips it.
 #[tokio::test]
 async fn a_turn_that_streamed_outlives_the_silence_bound() {
