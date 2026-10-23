@@ -762,9 +762,11 @@ impl ClaudeHarness {
         title_only: bool,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
         let exe = self.resolve_executable()?;
-        // A session with no conversation behind it cannot be resumed: the
-        // CLI says so and exits, every time. Start fresh instead — the
-        // chat's history is gone either way, and the user is told.
+        // A session whose transcript holds no conversation cannot be
+        // resumed: the CLI says so and exits, every time. Start fresh
+        // instead — the chat's history is gone either way, and the user is
+        // told. A transcript not found here is still resumed: the CLI may
+        // keep it elsewhere, and says so when it does not.
         let mut notice = None;
         let normalizer = match request.resume.clone() {
             Some(session_id) => {

@@ -265,10 +265,14 @@ fn is_synthetic_user_text(text: &str) -> bool {
 pub(crate) enum Transcript {
     /// A transcript with conversation in it.
     Conversation,
-    /// No transcript, or one without a single user or assistant line. The
-    /// CLI refuses to resume either ("No conversation found") and exits.
+    /// A transcript read through to its end without a single user or
+    /// assistant line. The CLI refuses to resume it ("No conversation
+    /// found") and exits.
     Empty,
-    /// The history could not be looked at: leave it to the CLI.
+    /// The history could not be looked at, or holds no file for the session
+    /// — the CLI may keep it under another config root (a wrapper setting
+    /// its own `CLAUDE_CONFIG_DIR`): leave it to the CLI, whose "No
+    /// conversation found" relaunches the run fresh when it truly is gone.
     Unknown,
 }
 
@@ -364,33 +368,46 @@ impl Normalizer {
         let Some(file) = projects.flatten().find_map(|project| {
             std::fs::File::open(project.path().join(format!("{session_id}.jsonl"))).ok()
         }) else {
-            return (norm, Transcript::Empty);
+            return (norm, Transcript::Unknown);
         };
         let mut transcript = Transcript::Empty;
+        // Only a transcript read whole, every line understood, is Empty: a
+        // read error or a line that might have been conversation leaves the
+        // call to the CLI.
+        let mut doubtful = false;
         let mut reader = std::io::BufReader::with_capacity(1 << 16, file);
         let mut line = Vec::new();
         loop {
             line.clear();
             match reader.read_until(b'\n', &mut line) {
-                Ok(0) | Err(_) => break,
+                Ok(0) => break,
+                Err(_) => {
+                    doubtful = true;
+                    break;
+                }
                 Ok(_) => {}
             }
             // Torn lines and older/newer unknown shapes are harmless.
             let Ok(text) = std::str::from_utf8(&line) else {
+                doubtful = true;
                 continue;
             };
             // Most of a transcript is bookkeeping (queue operations, request
             // records, attachments); one user or assistant record is enough.
             if transcript == Transcript::Empty
                 && (text.contains("\"type\":\"user\"") || text.contains("\"type\":\"assistant\""))
-                && serde_json::from_str::<Value>(text).is_ok_and(|record| {
-                    matches!(
-                        record.get("type").and_then(Value::as_str),
-                        Some("user" | "assistant")
-                    )
-                })
             {
-                transcript = Transcript::Conversation;
+                match serde_json::from_str::<Value>(text) {
+                    Ok(record) => {
+                        if matches!(
+                            record.get("type").and_then(Value::as_str),
+                            Some("user" | "assistant")
+                        ) {
+                            transcript = Transcript::Conversation;
+                        }
+                    }
+                    Err(_) => doubtful = true,
+                }
             }
             if !(text.contains("\"Agent\"")
                 || text.contains("\"Task\"")
@@ -447,6 +464,9 @@ impl Normalizer {
                 }
                 _ => {}
             }
+        }
+        if doubtful && transcript == Transcript::Empty {
+            transcript = Transcript::Unknown;
         }
         (norm, transcript)
     }
@@ -1524,9 +1544,10 @@ mod tests {
             )]
         );
         assert!(!norm.saw_init, "history must not consume the live init");
+        // Another config root may hold it: only the CLI can tell.
         let (missing, transcript) = Normalizer::for_resume(root.path(), "missing").await;
         assert!(missing.agent_tasks.is_empty());
-        assert_eq!(transcript, Transcript::Empty);
+        assert_eq!(transcript, Transcript::Unknown);
     }
 
     #[tokio::test]
@@ -1549,6 +1570,22 @@ mod tests {
             Normalizer::for_resume(root.path(), "bare").await.1,
             Transcript::Empty
         );
+        // A line that might have been conversation, cut short or not text:
+        // the CLI decides.
+        for (name, body) in [
+            (
+                "torn",
+                &b"{\"type\":\"last-prompt\"}\n{\"type\":\"user\",\"mess"[..],
+            ),
+            ("garbled", &b"{\"type\":\"last-prompt\"}\n\xff\xfe\n"[..]),
+        ] {
+            std::fs::write(project.join(format!("{name}.jsonl")), body).unwrap();
+            assert_eq!(
+                Normalizer::for_resume(root.path(), name).await.1,
+                Transcript::Unknown,
+                "{name}"
+            );
+        }
         // No history at all: nothing can be said either way.
         let nowhere = tempfile::tempdir().unwrap();
         assert_eq!(

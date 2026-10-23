@@ -1576,6 +1576,24 @@ async fn a_session_without_conversation_is_not_resumed() {
     let events = run_to_end(&harness(), resume_request("live-1", config.path()), again).await;
     assert!(!session_lost(&events), "{events:?}");
     assert_eq!(done(&events).1.as_deref(), Some("resumed=live-1"));
+
+    // No transcript here is no verdict: the CLI may keep its history under
+    // another config root (a wrapper setting its own), so it is still asked
+    // — and context survives the relaunch.
+    let (elsewhere, _steer, _token) = controls("A");
+    let events = run_to_end(
+        &harness(),
+        resume_request("kept-1", config.path()),
+        elsewhere,
+    )
+    .await;
+    assert!(!session_lost(&events), "{events:?}");
+    assert_eq!(done(&events).1.as_deref(), Some("resumed=kept-1"));
+    // Truly gone, the CLI's own answer still starts it fresh.
+    let (gone, _steer, _token) = controls("A");
+    let events = run_to_end(&harness(), resume_request("stale-3", config.path()), gone).await;
+    assert!(session_lost(&events), "{events:?}");
+    assert_eq!(done(&events).1.as_deref(), Some("resumed=none"));
 }
 
 /// A crash in any turn after the first used to end the stream with no Done
