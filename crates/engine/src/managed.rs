@@ -380,9 +380,6 @@ impl Engine {
             } => Err(anyhow::anyhow!("engine assembly failed: {failure}")),
         };
         tracing::info!("background engine shutting down");
-        // The app signs out, then stops the engine: the StopEngine may land
-        // before the auth watcher does, so the state decides, not the branch.
-        let signed_out = crate::forgoes_revival(engine.workspace_scope, &engine.auth.state());
         server.abort();
         boot.abort();
         // Before the data dir is released (with the runtime): no refresh may
@@ -390,10 +387,10 @@ impl Engine {
         engine.refresh_task.abort();
         engine.auth.quiesce_refresh(Duration::from_secs(10)).await;
         let runtime = engine.runtime.lock().await.take();
+        // The app signs out, then stops the engine: the StopEngine may land
+        // before the auth watcher does, so the runtime's shutdown decides
+        // revival from the auth state, not from the branch that fired.
         if let Some(runtime) = runtime {
-            if signed_out {
-                runtime.core().sessions.forgo_revival();
-            }
             runtime.shutdown().await;
         }
         outcome

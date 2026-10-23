@@ -579,6 +579,16 @@ impl EngineCore {
         // releases the next queued row. Freeze first so quitting never starts
         // recovered work while the engine is being torn down.
         self.doc_host.pause_all_queues();
+        // Decided here, from the auth state at the stop, so every way an
+        // engine goes down (headless, background, in-process) agrees.
+        let auth = self
+            .auth
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if auth.is_some_and(|auth| forgoes_revival(self.workspace_scope, &auth.state())) {
+            self.sessions.forgo_revival();
+        }
         self.sessions.shutdown().await;
         self.terminals.shutdown();
         self.sessions.stop_activity_projection().await;
@@ -1133,11 +1143,6 @@ impl Engine {
             }
         }
         tracing::info!("shutting down");
-        // Whichever stop got here first, a signed-out synced engine's
-        // cut-off turns stay ended.
-        if forgoes_revival(workspace_scope, &auth_state.borrow()) {
-            runtime.core().sessions.forgo_revival();
-        }
         server.abort();
         // No token refresh mid-exchange when the next engine takes over the
         // session file (a refresh token is single-use).
@@ -1152,10 +1157,11 @@ impl Engine {
 }
 
 /// Whether a stopping engine's cut-off turns stay ended rather than revive on
-/// the next boot: a synced engine whose account is signed out by the time it
-/// stops, whichever stop reached it first — the auth watcher, or the app's
-/// StopEngine right after its SignOut. Sign-out is the user ending the
-/// session, like a Stop. A local engine is signed out as a matter of course.
+/// the next boot ([`EngineCore::shutdown`] asks): a synced engine whose
+/// account is signed out by the time it stops, whichever stop reached it
+/// first — the auth watcher, or the app's StopEngine right after its SignOut.
+/// Sign-out is the user ending the session, like a Stop. A local engine is
+/// signed out as a matter of course.
 pub(crate) fn forgoes_revival(scope: WorkspaceScope, auth: &AuthState) -> bool {
     scope == WorkspaceScope::Synced && matches!(auth, AuthState::SignedOut)
 }
