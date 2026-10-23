@@ -328,10 +328,54 @@ pub(crate) fn parse_frame(line: &str) -> Result<Frame, serde_json::Error> {
             return Ok(frame);
         }
     }
-    if line.contains("\"type\":\"result\"") {
+    if top_level_type(line) == Some("result") {
         return Ok(Frame::Result(ResultFrame::unreadable(line)));
     }
     Err(error)
+}
+
+/// The `type` of a JSON object line, read at its top level alone however
+/// torn the rest is: a `"type":"result"` nested in some other frame (a
+/// tool's output, a message's content) must not end the turn.
+fn top_level_type(line: &str) -> Option<&str> {
+    let bytes = line.as_bytes();
+    let mut depth = 0usize;
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'{' | b'[' => depth += 1,
+            b'}' | b']' => depth = depth.checked_sub(1)?,
+            b'"' => {
+                let start = i + 1;
+                let end = string_end(bytes, start)?;
+                i = end + 1;
+                if depth == 1
+                    && &line[start..end] == "type"
+                    && let Some(value) = line[i..].trim_start().strip_prefix(':')
+                {
+                    let value = value.trim_start().strip_prefix('"')?;
+                    return Some(&value[..string_end(value.as_bytes(), 0)?]);
+                }
+                continue;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    None
+}
+
+/// Index of the quote closing a JSON string whose contents start at `start`.
+fn string_end(bytes: &[u8], start: usize) -> Option<usize> {
+    let mut i = start;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' => i += 2,
+            b'"' => return Some(i),
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 fn parse_value(line: &str) -> Result<Value, serde_json::Error> {
@@ -685,6 +729,19 @@ mod tests {
         }
         // Anything else torn stays an error.
         assert!(parse_frame(r#"{"type":"assistant","message":"#).is_err());
+        // Only the line's own type counts: a result nested in another frame
+        // is no result, while a result whose type comes later still is.
+        for line in [
+            r#"{"type":"user","message":{"content":[{"type":"result","text":"tor"#,
+            r#"{"type":"system","subtype":"init","session_id":5,"x":{"type":"result"}}"#,
+            r#"{"type":"assistant","message":"say \"type\":\"result\" {","#,
+        ] {
+            assert!(parse_frame(line).is_err(), "{line}");
+        }
+        assert!(matches!(
+            parse_frame(r#"{"subtype":"success","note":"{\"type\":1}","type":"result","res"#),
+            Ok(Frame::Result(f)) if f.unreadable
+        ));
     }
 
     #[test]
