@@ -50,14 +50,15 @@ impl Dialogs {
             multiline: method == "editor",
         };
         // Pi's `timeout` is in milliseconds; 0 means none, and a negative one
-        // has already expired, so the dialog is over before it is shown.
+        // has already expired, so the dialog is over before it is shown. One
+        // too large for a Duration is as good as none.
         let timeout = match frame["timeout"].as_f64() {
             Some(ms) if ms < 0.0 => {
                 let _ =
                     client.send(json!({"type":"extension_ui_response","id":id,"cancelled":true}));
                 return;
             }
-            Some(ms) if ms > 0.0 => Some(std::time::Duration::from_secs_f64(ms / 1000.0)),
+            Some(ms) if ms > 0.0 => std::time::Duration::try_from_secs_f64(ms / 1000.0).ok(),
             _ => None,
         };
         let question_id = question.id.clone();
@@ -219,5 +220,45 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["id"], "open");
+    }
+
+    #[tokio::test]
+    async fn a_timeout_too_large_for_a_duration_waits_like_none() {
+        let (writer, peer) = tokio::io::duplex(4096);
+        let (_peer_writer, reader) = tokio::io::duplex(4096);
+        let transport = super::super::rpc::Transport::new(writer, reader);
+        let (bridge, mut requests) = tokio::sync::mpsc::unbounded_channel();
+        let mut dialogs = Dialogs {
+            input: Some(Arc::new(move |_| {
+                let (tx, rx) = oneshot::channel();
+                bridge.send(tx).unwrap();
+                rx
+            })),
+            ..Default::default()
+        };
+        let mut lines = BufReader::new(peer).lines();
+        dialogs.request(
+            transport.client.clone(),
+            &json!({"id":"huge", "method":"confirm", "timeout":1e300}),
+        );
+        let sender = requests.recv().await.unwrap();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), lines.next_line())
+                .await
+                .is_err(),
+            "a huge timeout closed the dialog at once"
+        );
+        sender
+            .send(vec![UserInputAnswer {
+                question_id: String::new(),
+                labels: vec![],
+            }])
+            .ok();
+        let reply = tokio::time::timeout(std::time::Duration::from_secs(1), lines.next_line())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&reply).unwrap()["id"], "huge");
     }
 }
