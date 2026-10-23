@@ -71,6 +71,10 @@ const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(12);
 /// either rides as the path ref already in the text, which the agent can read.
 const INLINE_IMAGE_MAX: u64 = 4 * 1024 * 1024;
 const INLINE_IMAGES_TOTAL: u64 = 8 * 1024 * 1024;
+/// How long a send may go without a single SDK update before the shim
+/// abandons the turn as errored. A run streams updates from its first model
+/// step, so this only bounds a wedged send, never a long-running tool.
+const DEFAULT_SILENCE_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -105,6 +109,7 @@ pub struct CursorHarness {
     interrupt_grace: Duration,
     kill_grace: Duration,
     stop_timeout: Duration,
+    silence_timeout: Duration,
     /// Credential-scoped successful catalog, with bounded refresh and backoff.
     pub(crate) models_cache: catalog::Catalog,
     /// Models whose catalog default is a Max Mode variant, from the latest
@@ -121,6 +126,7 @@ impl Default for CursorHarness {
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
             stop_timeout: DEFAULT_STOP_TIMEOUT,
+            silence_timeout: DEFAULT_SILENCE_TIMEOUT,
             models_cache: catalog::Catalog::default(),
             max_mode_defaults: Default::default(),
         }
@@ -156,6 +162,13 @@ impl CursorHarness {
     #[doc(hidden)]
     pub fn with_stop_timeout(mut self, timeout: Duration) -> Self {
         self.stop_timeout = timeout;
+        self
+    }
+
+    /// Tune the silent-send bound (tests shrink it; default 10 minutes).
+    #[doc(hidden)]
+    pub fn with_silence_timeout(mut self, timeout: Duration) -> Self {
+        self.silence_timeout = timeout;
         self
     }
 
@@ -439,6 +452,7 @@ impl Harness for CursorHarness {
             // One send can batch several messages' images; the shim keeps
             // each send under the same total.
             "imageBudget": INLINE_IMAGES_TOTAL,
+            "silenceTimeoutMs": u64::try_from(self.silence_timeout.as_millis()).unwrap_or(u64::MAX),
         });
         let _ = stdin_tx.send(first.to_string());
 

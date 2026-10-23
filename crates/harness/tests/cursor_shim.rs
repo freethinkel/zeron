@@ -1032,6 +1032,47 @@ async fn a_stop_during_agent_creation_settles_once() {
     assert!(fixture.prompts().is_empty());
 }
 
+/// A send the SDK never answers with a single update ends the turn errored
+/// at the silence bound, whether the send itself or its run went quiet.
+#[tokio::test]
+async fn a_send_with_no_update_at_all_is_abandoned_at_the_bound() {
+    for prompt in ["silent", "silent-send"] {
+        let fixture = SessionFixture::new();
+        let (mut child, stdin, mut lines) = fixture
+            .start_frame(prompt, serde_json::json!({"silenceTimeoutMs": 300}))
+            .await;
+        let frames = turn_frames(&mut lines).await;
+        let last = frames.last().unwrap();
+        assert_eq!(last["status"], "error", "{prompt}: {frames:?}");
+        assert!(
+            last["error"]
+                .as_str()
+                .unwrap()
+                .contains("sent nothing back"),
+            "{prompt}: {frames:?}"
+        );
+        finish(&mut child, stdin).await;
+    }
+}
+
+/// Updates keep a turn alive past the bound: only total silence trips it.
+#[tokio::test]
+async fn a_turn_that_streamed_outlives_the_silence_bound() {
+    let fixture = SessionFixture::new();
+    let (mut child, stdin, mut lines) = fixture
+        .start_frame("hang", serde_json::json!({"silenceTimeoutMs": 200}))
+        .await;
+    assert_eq!(frame(&mut lines).await["ev"], "ready");
+    assert_eq!(frame(&mut lines).await["ev"], "text");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(600), lines.next_line())
+            .await
+            .is_err(),
+        "a turn that streamed was abandoned"
+    );
+    finish(&mut child, stdin).await;
+}
+
 /// Images batched into one send stay under the engine's inline budget.
 #[tokio::test]
 async fn one_send_inlines_images_only_up_to_the_budget() {

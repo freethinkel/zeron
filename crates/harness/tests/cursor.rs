@@ -807,3 +807,20 @@ async fn oversized_attachments_are_not_inlined() {
     );
 }
 
+/// The shim learns the inline image budget and the silent-send bound.
+#[tokio::test]
+async fn the_run_frame_carries_the_send_bounds() {
+    let (controls, _steer, _token) = controls();
+    let harness = harness().with_silence_timeout(Duration::from_millis(1234));
+    let events = run_to_first_done(&harness, request("scenario:send-bounds"), controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}

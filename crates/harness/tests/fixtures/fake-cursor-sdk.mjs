@@ -40,6 +40,8 @@ function instance(store) {
     async send(message,{onDelta,model,local}) {
       const prompt=typeof message==='string'?message:message.text;
       store.logPrompt(prompt);
+      // A send that never comes back, with no update ever.
+      if(prompt==='silent-send') return new Promise(()=>{});
       if(model) store.logModel(prompt,model.id);
       const doc=await store.agents.get({});
       if(doc.activeRunId) throw new Error('Agent already has active run');
@@ -51,7 +53,7 @@ function instance(store) {
       await store.agents.update({agent:{...doc,status:'running',activeRunId:runId}});
       if(isUncheckpointed(prompt))throw new Error('cancelled before checkpoint');
       if(prompt==='send-error') throw new Error('transport failed during send');
-      if(prompt!=='result-only') onDelta({update:{type:'text-delta',text:doc.latestCheckpoint.rootBlobId}});
+      if(!['result-only','silent'].includes(prompt)) onDelta({update:{type:'text-delta',text:doc.latestCheckpoint.rootBlobId}});
       if(prompt==='image') onDelta({update:{type:'text-delta',text:' images:'+message.images.map(i=>i.mimeType+'/'+i.data).join(',')}});
       if(['transport-dump','transport-quoted'].includes(prompt)) {
         onDelta({update:{type:'tool-call-started',callId:'t1',toolCall:{type:'shell'}}});
@@ -124,7 +126,7 @@ function instance(store) {
             await new Promise(r=>setTimeout(r,50));
           }
           if(prompt==='result-only'){await finish('finished');return {status:'finished',result:'settled reply'};}
-          if(['hang','hung-cancel','native-steer','native-revert','native-tool','native-concurrent','native-mixed'].includes(prompt))return pending;
+          if(['hang','silent','hung-cancel','native-steer','native-revert','native-tool','native-concurrent','native-mixed'].includes(prompt))return pending;
           await finish('finished');return {status:'finished'};
         },
       };

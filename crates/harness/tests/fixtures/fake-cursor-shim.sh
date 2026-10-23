@@ -160,6 +160,16 @@ case "$first" in
   read -r next || exit 0
   ;;
 
+*scenario:send-bounds*)
+  case "$first" in
+    *'"imageBudget":8388608,'*'"silenceTimeoutMs":1234'*) ;;
+    *) emit '{"ev":"fatal","message":"send bounds missing"}'; exit 1 ;;
+  esac
+  emit '{"ev":"ready","agentId":"agent-bounds","model":"auto"}'
+  emit '{"ev":"turn","status":"finished"}'
+  read -r next || exit 0
+  ;;
+
 *scenario:interrupt-fatal*)
   emit '{"ev":"ready","agentId":"agent-int-fatal","model":"auto"}'
   emit '{"ev":"text","text":"working"}'

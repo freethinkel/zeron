@@ -12,10 +12,13 @@
 // Protocol: JSONL, one frame per line.
 //   stdin  (engine → shim):
 //     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?,"images"?,
-//      "imageBudget"?}
+//      "imageBudget"?,"silenceTimeoutMs"?}
 //                                                       start / first turn;
 //                                                       `imageBudget` = bytes of
-//                                                       images one send inlines
+//                                                       images one send inlines,
+//                                                       `silenceTimeoutMs` = how
+//                                                       long a send may go without
+//                                                       any SDK update
 //     {"op":"user","prompt"}                            explicit next turn
 //     {"op":"steer","prompt","model"?,"modelOptions"?,"reconfigure"?,"images"?}
 //                                                       native mid-turn input;
@@ -628,8 +631,10 @@ async function followupSteers() {
     }, undelivered.flatMap(message => message.images));
   }
 }
-// Bytes of images one send may inline: set by the engine's run frame.
+// Bytes of images one send may inline, and how long a send may go without
+// a single SDK update: set by the engine's run frame.
 let imageBudget = Infinity;
+let silenceTimeoutMs = 10 * 60 * 1000;
 // Several messages' images can ride one send (a batched follow-up). Past the
 // budget the rest ride as the path refs already in their text.
 function withinBudget(images) {
@@ -640,6 +645,21 @@ function withinBudget(images) {
     left -= bytes;
     return true;
   });
+}
+// The SDK can go silent for good after a send (a large inlined image did,
+// live: no update for 400s+, never settling). A run streams updates from its
+// first model step, and a running tool has announced itself by then, so a
+// send with no update at all past the bound is wedged, not slow.
+const SILENT = Symbol("silent");
+function silenceWatch() {
+  let timer;
+  let fire;
+  const silent = new Promise((resolve) => { fire = resolve; });
+  return {
+    silent,
+    arm() { timer = setTimeout(fire, silenceTimeoutMs, SILENT); },
+    heard() { clearTimeout(timer); },
+  };
 }
 // `{type, data, mimeType}` blocks from the engine → the SDK's image shape.
 function sdkImages(images) {
@@ -659,7 +679,36 @@ function acceptSteer(message) {
 }
 
 async function runTurn(prompt, ready, accepted, images = []) {
-  images = withinBudget(images);
+  const watch = silenceWatch();
+  try {
+    await sendTurn(prompt, ready, accepted, withinBudget(images), watch);
+  } finally {
+    watch.heard();
+  }
+}
+
+// The send outlived the silence bound: abandon the turn with a clear error
+// (the engine retires this process; the next message resumes the agent).
+function abandonSilentTurn(pending) {
+  void pending?.then((late) => late?.cancel().catch(() => {}), () => {});
+  if (run) run.cancel().catch(() => {});
+  activeTools.clear();
+  run = null;
+  turnActive = false;
+  const seconds = Math.max(1, Math.round(silenceTimeoutMs / 1000));
+  const span = seconds >= 120 ? `${Math.round(seconds / 60)} minutes` : `${seconds} seconds`;
+  out({
+    ev: "turn",
+    status: interrupted || stopping ? "cancelled" : "error",
+    ...(interrupted || stopping ? {} : {
+      error: `Cursor sent nothing back for ${span} after the message went out, ` +
+        "so the turn was abandoned. Send it again to retry.",
+    }),
+  });
+  stopping = false;
+}
+
+async function sendTurn(prompt, ready, accepted, images, watch) {
   turnActive = true;
   if (closing) return;
   try {
@@ -681,6 +730,7 @@ async function runTurn(prompt, ready, accepted, images = []) {
       ...(modelChanged ? { model: currentModel } : {}),
       ...(local ? { local } : {}),
       onDelta: ({ update }) => {
+        watch.heard();
         if (thisRun && thisRun === preemptedRun) return;
         try {
           mapUpdate(update);
@@ -689,17 +739,26 @@ async function runTurn(prompt, ready, accepted, images = []) {
         }
       },
     });
+    watch.arm();
+    const sent = async (local) => {
+      const pending = send(local);
+      const outcome = await Promise.race([pending, watch.silent]);
+      if (outcome === SILENT) throw Object.assign(new Error("silent"), { silent: pending });
+      return outcome;
+    };
     try {
-      run = thisRun = await send();
+      run = thisRun = await sent();
     } catch (e) {
+      if (e?.silent) throw e;
       // The agent's persisted run never reached a terminal state (a process
       // that died mid-run, a cancel that wedged). This send is the only run
       // this process starts on the agent, so expiring that stale run — the
       // SDK's own recovery option — is safe. Once.
       if (!/already has (?:an )?active run/i.test(String(e?.message ?? e))) throw e;
-      run = thisRun = await send({ force: true });
+      run = thisRun = await sent({ force: true });
     }
   } catch (e) {
+    if (e?.silent) return abandonSilentTurn(e.silent);
     out({ ev: "turn", status: "error", error: withAuthHint(formatError(e, run?.requestId)) });
     run = null;
     turnActive = false;
@@ -711,7 +770,8 @@ async function runTurn(prompt, ready, accepted, images = []) {
   if (interrupted || stopping || closing) await run.cancel().catch(() => {});
   let result;
   try {
-    result = await run.wait();
+    result = await Promise.race([run.wait(), watch.silent]);
+    if (result === SILENT) return abandonSilentTurn();
   } catch (e) {
     if (preempting && !interrupted && !stopping && !closing) return continueAfterPreempt();
     const stopped = stopping;
@@ -773,6 +833,10 @@ function modelSelection(msg) {
 
 async function start(msg) {
   if (Number.isFinite(msg.imageBudget) && msg.imageBudget >= 0) imageBudget = msg.imageBudget;
+  // setTimeout fires at once past 2^31-1 ms; clamp to it (about 24 days).
+  if (Number.isFinite(msg.silenceTimeoutMs) && msg.silenceTimeoutMs > 0) {
+    silenceTimeoutMs = Math.min(msg.silenceTimeoutMs, 2 ** 31 - 1);
+  }
   const model = modelSelection(msg);
   currentModel = model;
   // The SDK loads NO ambient settings unless asked: without settingSources the
