@@ -1129,6 +1129,8 @@ impl Engine {
                 // the localhost server itself is aborted.
                 runtime.disconnect_edge();
                 tracing::info!("headless authentication revoked; stopping synced runtime");
+                // Sign-out ends the user's turns; none restart on next sign-in.
+                runtime.core().sessions.forgo_revival();
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }
