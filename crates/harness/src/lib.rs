@@ -318,18 +318,22 @@ pub mod windows_process;
 /// CLIs such as Homebrew's `gh` without changing the daemon's own environment.
 pub fn compose_login_shell_path(cmd: &mut tokio::process::Command) {
     compose_path(cmd.as_std_mut(), std::iter::empty());
+    apply_login_shell_env(cmd.as_std_mut());
 }
 
 /// Compose the child's PATH: the resolved executable's directory first, then
-/// our own PATH, then the login-shell PATH snapshot — deduped. npm-shim CLIs
-/// are `#!/usr/bin/env node` scripts whose `node` lives beside them in the
-/// version manager's bin dir, and the CLIs themselves shell out to tools
-/// (git, rg, node) that a GUI/service launch's own PATH may lack.
+/// the user's own PATH (the login shell's), then this process's — deduped.
+/// npm-shim CLIs are `#!/usr/bin/env node` scripts whose `node` lives beside
+/// them in the version manager's bin dir, and the CLIs themselves shell out
+/// to tools (git, rg, node) that a GUI/service launch's own PATH may lack.
+/// Also hands the child the login shell's TLS, SSH-agent and locale
+/// variables when this process has none of its own.
 pub fn compose_child_path(cmd: &mut process::Command, exe: &std::path::Path) {
     compose_path(
         cmd.as_std_mut(),
         exe.parent().filter(|d| !d.as_os_str().is_empty()),
     );
+    apply_login_shell_env(cmd.as_std_mut());
 }
 
 /// Apply the host-resolved run environment ([`RunRequest::env`] — credential
@@ -345,20 +349,83 @@ fn compose_path<'a>(
     cmd: &mut std::process::Command,
     executable_dir: impl IntoIterator<Item = &'a std::path::Path>,
 ) {
-    let mut paths: Vec<std::path::PathBuf> = Vec::new();
-    for dir in executable_dir {
-        paths.push(dir.to_path_buf());
-    }
-    if let Some(path) = std::env::var_os("PATH") {
-        paths.extend(std::env::split_paths(&path));
-    }
-    if let Some(shell_path) = shell_env::login_shell_path() {
-        paths.extend(std::env::split_paths(shell_path));
-    }
-    let mut seen = std::collections::HashSet::new();
-    paths.retain(|p| !p.as_os_str().is_empty() && seen.insert(p.clone()));
+    let executable_dir: Vec<std::path::PathBuf> =
+        executable_dir.into_iter().map(Into::into).collect();
+    let own = std::env::var_os("PATH");
+    let user = shell_env::user_path();
+    #[cfg(windows)]
+    let node_dirs = executable::node_manager_dirs();
+    #[cfg(not(windows))]
+    let node_dirs = Vec::new();
+    let paths = child_path_entries(
+        executable::Platform::current(),
+        executable_dir,
+        own.as_deref(),
+        user.as_deref(),
+        node_dirs,
+    );
     if let Ok(joined) = std::env::join_paths(paths) {
         cmd.env("PATH", joined);
+    }
+}
+
+/// The child PATH's entries in precedence order. Unix puts the login shell's
+/// PATH before our own: a Dock/launchd launch inherits only the system PATH,
+/// whose `/usr/bin` stubs would otherwise shadow the user's Homebrew or nvm
+/// toolchain. Windows keeps its own PATH first (it already came from the
+/// user's environment, plus per-session additions like fnm's) and adds what
+/// the registry gained since we started, then the node-manager directories
+/// discovery searched, so `node`/`npx` MCP servers resolve like the CLI did.
+fn child_path_entries(
+    platform: executable::Platform,
+    executable_dir: Vec<std::path::PathBuf>,
+    own: Option<&std::ffi::OsStr>,
+    user: Option<&std::ffi::OsStr>,
+    node_dirs: Vec<std::path::PathBuf>,
+) -> Vec<std::path::PathBuf> {
+    let split = |path: Option<&std::ffi::OsStr>| -> Vec<std::path::PathBuf> {
+        path.map(|p| std::env::split_paths(p).collect())
+            .unwrap_or_default()
+    };
+    let mut paths = executable_dir;
+    if platform == executable::Platform::Windows {
+        paths.extend(split(own));
+        paths.extend(split(user));
+    } else {
+        paths.extend(split(user));
+        paths.extend(split(own));
+    }
+    paths.extend(node_dirs);
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| {
+        let key = if platform == executable::Platform::Windows {
+            // `C:\Tools\` and `c:\tools` are one directory to Windows.
+            p.to_string_lossy()
+                .trim_end_matches(['\\', '/'])
+                .to_lowercase()
+        } else {
+            p.components()
+                .collect::<std::path::PathBuf>()
+                .to_string_lossy()
+                .into_owned()
+        };
+        !key.is_empty() && seen.insert(key)
+    });
+    paths
+}
+
+/// Login-shell variables (TLS trust, SSH agent, locale) the child lacks:
+/// absent from our own environment and not set or removed by the driver.
+fn apply_login_shell_env(cmd: &mut std::process::Command) {
+    let defaults = shell_env::child_env_defaults();
+    if defaults.is_empty() {
+        return;
+    }
+    let explicit: Vec<std::ffi::OsString> = cmd.get_envs().map(|(k, _)| k.to_owned()).collect();
+    for (key, value) in defaults {
+        if !explicit.contains(&key) {
+            cmd.env(key, value);
+        }
     }
 }
 
@@ -556,12 +623,18 @@ pub(crate) async fn shutdown_agent(
     }
 }
 
-/// Reap the child: Unix sends SIGTERM then SIGKILL after `kill_grace`;
-/// Windows terminates the owned job after protocol shutdown has finished.
+/// Reap the child: Unix sends SIGTERM then SIGKILL after `kill_grace`.
+/// Windows has no SIGTERM for a windowless child: its stdin is closed and it
+/// gets `kill_grace` to exit on its own (callers have already sent their
+/// protocol shutdown), so an agent is not killed mid-write to its session
+/// files; then the owned job is terminated, descendants included.
 pub(crate) async fn shutdown_child(child: &mut process::Child, kill_grace: std::time::Duration) {
     #[cfg(windows)]
     {
-        let _ = kill_grace;
+        if !matches!(child.try_wait(), Ok(Some(_))) {
+            // wait() drops the child's stdin first: EOF is the cue to exit.
+            let _ = tokio::time::timeout(kill_grace, child.wait()).await;
+        }
         let _ = child.start_kill();
         let _ = child.wait().await;
         return;
@@ -627,6 +700,59 @@ pub fn supports_titles(id: HarnessId) -> bool {
         id,
         HarnessId::Codex | HarnessId::ClaudeCode | HarnessId::Mock
     )
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::child_path_entries;
+    use crate::executable::Platform;
+    use std::path::PathBuf;
+
+    fn joined(entries: &[&str]) -> std::ffi::OsString {
+        std::env::join_paths(entries).unwrap()
+    }
+
+    #[test]
+    fn unix_child_path_puts_the_login_shell_before_a_gui_launch_path() {
+        let own = joined(&["/usr/bin", "/bin"]);
+        let user = joined(&["/opt/homebrew/bin", "/usr/bin/", "/bin"]);
+        let paths = child_path_entries(
+            Platform::Unix,
+            vec![PathBuf::from("/Users/a/.nvm/versions/node/v22/bin")],
+            Some(&own),
+            Some(&user),
+            Vec::new(),
+        );
+        assert_eq!(
+            paths,
+            [
+                "/Users/a/.nvm/versions/node/v22/bin",
+                "/opt/homebrew/bin",
+                "/usr/bin/",
+                "/bin"
+            ]
+            .map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn windows_child_path_appends_registry_and_node_dirs_case_insensitively() {
+        // Built from strings: `join_paths` would use this host's separator.
+        let paths = child_path_entries(
+            Platform::Windows,
+            vec![PathBuf::from(r"C:\Users\a\AppData\Roaming\npm")],
+            None,
+            None,
+            vec![
+                PathBuf::from(r"c:\users\a\appdata\roaming\npm\"),
+                PathBuf::from(r"C:\nvm4w\nodejs"),
+            ],
+        );
+        assert_eq!(
+            paths,
+            [r"C:\Users\a\AppData\Roaming\npm", r"C:\nvm4w\nodejs"].map(PathBuf::from)
+        );
+    }
 }
 
 #[cfg(test)]

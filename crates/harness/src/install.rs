@@ -224,8 +224,8 @@ fn configure(command: &mut Command) {
     let mut paths: Vec<_> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    if let Some(path) = crate::shell_env::login_shell_path() {
-        paths.extend(std::env::split_paths(path));
+    if let Some(path) = crate::shell_env::user_path() {
+        paths.extend(std::env::split_paths(&path));
     }
     // npm can be found in a managed toolchain even when shell startup was disabled.
     if let Some(npm) =

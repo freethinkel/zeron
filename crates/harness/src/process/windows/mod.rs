@@ -107,8 +107,26 @@ impl Child {
 }
 
 impl Command {
+    /// Launch the command. Creation that fails while the image is locked
+    /// (the malware scanner on a just-updated CLI) is retried with a short
+    /// backoff.
     pub fn spawn(&mut self) -> io::Result<Child> {
-        spawn_prepared(self, |_| Ok(()))
+        let mut delays = super::SPAWN_RETRY_DELAYS.into_iter();
+        loop {
+            let prepared = self.prepare()?;
+            let launched = prepared.launched.clone();
+            match launch(self, prepared, |_| Ok(())) {
+                Err(error) if super::spawn_retryable(&error, modified_ago(&launched)) => {
+                    let Some(delay) = delays.next() else {
+                        return Err(error);
+                    };
+                    tracing::debug!(%error, image = %launched.display(), "retrying agent launch");
+                    // Rare and short; callers are synchronous by signature.
+                    std::thread::sleep(delay);
+                }
+                result => return result,
+            }
+        }
     }
 
     pub async fn output(&mut self) -> io::Result<Output> {
@@ -119,11 +137,26 @@ impl Command {
 
 // A private hook makes the critical interval testable: the process exists but
 // is still suspended, and no monitor has been started. Production uses a no-op.
+#[cfg(test)]
 fn spawn_prepared(
     command: &Command,
     after_create: impl FnOnce(&Child) -> io::Result<()>,
 ) -> io::Result<Child> {
-    let mut prepared = command.prepare()?;
+    launch(command, command.prepare()?, after_create)
+}
+
+fn modified_ago(path: &std::path::Path) -> Option<std::time::Duration> {
+    std::fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .ok()
+        .and_then(|modified| modified.elapsed().ok())
+}
+
+fn launch(
+    command: &Command,
+    mut prepared: command::Prepared,
+    after_create: impl FnOnce(&Child) -> io::Result<()>,
+) -> io::Result<Child> {
     let job = Arc::new(Job::new()?);
     let escrow = escrow::Escrow::new(&job)?;
     let (input, stdin) = command.stdio[0].open(0)?;

@@ -4,10 +4,33 @@
 pub use std::process::Stdio;
 #[cfg(not(windows))]
 pub use tokio::process::{Child, ChildStdin, ChildStdout, Command};
+#[cfg(any(windows, test))]
+pub(crate) mod cmd_shim;
 #[cfg(windows)]
 mod windows;
 #[cfg(windows)]
 pub use windows::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+/// Backoff for a Windows process creation that failed transiently.
+#[cfg(any(windows, test))]
+const SPAWN_RETRY_DELAYS: [std::time::Duration; 3] = [
+    std::time::Duration::from_millis(100),
+    std::time::Duration::from_millis(300),
+    std::time::Duration::from_millis(1000),
+];
+
+/// Whether a failed Windows process creation is worth retrying: a sharing
+/// or lock violation on the image, or access denied on one modified in the
+/// last minute (the malware scanner holding a CLI that just updated).
+/// `image_age` is how long ago the launched image was last written.
+#[cfg(any(windows, test))]
+fn spawn_retryable(error: &std::io::Error, image_age: Option<std::time::Duration>) -> bool {
+    match error.raw_os_error() {
+        Some(32 | 33) => true,
+        Some(5) => image_age.is_some_and(|age| age < std::time::Duration::from_secs(60)),
+        _ => false,
+    }
+}
 
 #[cfg(unix)]
 pub(crate) fn signal_target(child: &Child) -> Option<i32> {
@@ -32,8 +55,55 @@ pub(crate) fn signal_target(child: &Child) -> Option<std::sync::Arc<crate::windo
 /// shell outlives its agent (verified live, Claude 2.1.286: its own task
 /// stop and SIGTERM both leave the shell running). Snapshot while the agent
 /// is alive: once it exits, its orphans are reparented and untraceable.
+///
+/// Each descendant's start time is recorded with it, so [`terminate_tree`]
+/// can tell the process it found from an unrelated one that inherited the
+/// pid after it exited.
 #[cfg(unix)]
 pub(crate) async fn descendants(root: u32) -> Vec<i32> {
+    let mut table = tokio::task::spawn_blocking(proc_table::read)
+        .await
+        .unwrap_or_default();
+    if table.is_empty() {
+        // No /proc or libproc view (or a sandbox hid it): ask ps.
+        table = ps_table().await;
+    }
+    let found = tree_of(root as i32, &table);
+    identities::record(
+        table
+            .iter()
+            .filter(|entry| found.contains(&entry.pid))
+            .filter_map(|entry| Some((entry.pid, entry.start?))),
+    );
+    found
+}
+
+/// One process-table row; `start` identifies the process across pid reuse.
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcEntry {
+    pid: i32,
+    ppid: i32,
+    start: Option<u64>,
+}
+
+#[cfg(unix)]
+fn tree_of(root: i32, table: &[ProcEntry]) -> Vec<i32> {
+    let mut found = Vec::new();
+    let mut frontier = vec![root];
+    while let Some(parent) = frontier.pop() {
+        for entry in table {
+            if entry.ppid == parent && entry.pid > 1 && !found.contains(&entry.pid) {
+                found.push(entry.pid);
+                frontier.push(entry.pid);
+            }
+        }
+    }
+    found
+}
+
+#[cfg(unix)]
+async fn ps_table() -> Vec<ProcEntry> {
     let Ok(out) = tokio::process::Command::new("ps")
         .args(["-A", "-o", "pid=,ppid="])
         .stdin(std::process::Stdio::null())
@@ -41,58 +111,249 @@ pub(crate) async fn descendants(root: u32) -> Vec<i32> {
         .output()
         .await
     else {
+        tracing::warn!("no process table (/proc or ps): agent descendants cannot be traced");
         return Vec::new();
     };
-    let table: Vec<(i32, i32)> = String::from_utf8_lossy(&out.stdout)
+    String::from_utf8_lossy(&out.stdout)
         .lines()
         .filter_map(|line| {
             let mut cols = line.split_whitespace().map(str::parse::<i32>);
-            Some((cols.next()?.ok()?, cols.next()?.ok()?))
+            let (pid, ppid) = (cols.next()?.ok()?, cols.next()?.ok()?);
+            Some(ProcEntry {
+                pid,
+                ppid,
+                start: proc_table::start_time(pid),
+            })
         })
-        .collect();
-    let mut found = Vec::new();
-    let mut frontier = vec![root as i32];
-    while let Some(parent) = frontier.pop() {
-        for &(pid, ppid) in &table {
-            if ppid == parent && pid > 1 && !found.contains(&pid) {
-                found.push(pid);
-                frontier.push(pid);
-            }
+        .collect()
+}
+
+/// Native process-table readers: Linux's /proc (slim images often ship no
+/// `ps`) and macOS's libproc. Both report each process's start time.
+#[cfg(unix)]
+mod proc_table {
+    use super::ProcEntry;
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn read() -> Vec<ProcEntry> {
+        let Ok(dir) = std::fs::read_dir("/proc") else {
+            return Vec::new();
+        };
+        dir.flatten()
+            .filter_map(|entry| entry.file_name().to_str()?.parse::<i32>().ok())
+            .filter_map(|pid| {
+                let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+                let (ppid, start) = parse_stat(&stat)?;
+                Some(ProcEntry {
+                    pid,
+                    ppid,
+                    start: Some(start),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn start_time(pid: i32) -> Option<u64> {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        parse_stat(&stat).map(|(_, start)| start)
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn read() -> Vec<ProcEntry> {
+        // SAFETY: a null buffer asks only for the current pid count.
+        let count = unsafe { libc::proc_listallpids(std::ptr::null_mut(), 0) };
+        if count <= 0 {
+            return Vec::new();
+        }
+        // Headroom for processes started between the two calls.
+        let mut pids = vec![0 as libc::pid_t; count as usize + 64];
+        let bytes = (pids.len() * std::mem::size_of::<libc::pid_t>()) as libc::c_int;
+        // SAFETY: `bytes` is the buffer's true size.
+        let filled = unsafe { libc::proc_listallpids(pids.as_mut_ptr().cast(), bytes) };
+        if filled <= 0 {
+            return Vec::new();
+        }
+        pids.truncate((filled as usize).min(pids.len()));
+        pids.into_iter()
+            .filter_map(|pid| {
+                let info = bsd_info(pid)?;
+                Some(ProcEntry {
+                    pid,
+                    ppid: info.pbi_ppid as i32,
+                    start: Some(start_of(&info)),
+                })
+            })
+            .collect()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub(super) fn start_time(pid: i32) -> Option<u64> {
+        bsd_info(pid).map(|info| start_of(&info))
+    }
+
+    #[cfg(target_os = "macos")]
+    fn bsd_info(pid: i32) -> Option<libc::proc_bsdinfo> {
+        // SAFETY: proc_bsdinfo is plain data; proc_pidinfo writes at most
+        // `size` bytes into it and reports how many it wrote.
+        unsafe {
+            let mut info: libc::proc_bsdinfo = std::mem::zeroed();
+            let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+            let written = libc::proc_pidinfo(
+                pid,
+                libc::PROC_PIDTBSDINFO,
+                0,
+                (&mut info as *mut libc::proc_bsdinfo).cast(),
+                size,
+            );
+            (written == size).then_some(info)
         }
     }
-    found
+
+    #[cfg(target_os = "macos")]
+    fn start_of(info: &libc::proc_bsdinfo) -> u64 {
+        info.pbi_start_tvsec * 1_000_000 + info.pbi_start_tvusec
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn read() -> Vec<ProcEntry> {
+        Vec::new()
+    }
+
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    pub(super) fn start_time(_pid: i32) -> Option<u64> {
+        None
+    }
+
+    /// `(ppid, starttime)` from a `/proc/<pid>/stat` line: fields 4 and 22,
+    /// counted after the parenthesized command name (which may itself hold
+    /// spaces and parentheses).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(super) fn parse_stat(stat: &str) -> Option<(i32, u64)> {
+        let rest = &stat[stat.rfind(')')? + 1..];
+        let fields: Vec<&str> = rest.split_whitespace().collect();
+        Some((fields.get(1)?.parse().ok()?, fields.get(19)?.parse().ok()?))
+    }
+}
+
+/// Start times recorded by [`descendants`] snapshots, consulted before every
+/// signal [`terminate_tree`] sends. The shared drivers pass bare pids
+/// between the two, so the identity travels here.
+#[cfg(unix)]
+mod identities {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Snapshots whose teardown never ran (a run that ended cleanly) leave
+    /// entries behind; past this size dead ones are pruned.
+    const PRUNE_AT: usize = 4096;
+
+    fn map() -> std::sync::MutexGuard<'static, HashMap<i32, u64>> {
+        static MAP: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
+        MAP.get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+    }
+
+    pub(super) fn record(entries: impl IntoIterator<Item = (i32, u64)>) {
+        let mut map = map();
+        map.extend(entries);
+        if map.len() > PRUNE_AT {
+            map.retain(|&pid, start| super::proc_table::start_time(pid) == Some(*start));
+        }
+    }
+
+    pub(super) fn get(pid: i32) -> Option<u64> {
+        map().get(&pid).copied()
+    }
+
+    pub(super) fn forget(pids: &[i32]) {
+        let mut map = map();
+        for pid in pids {
+            map.remove(pid);
+        }
+    }
+}
+
+/// Whether `pid` is still the process a snapshot found: same start time when
+/// one was recorded, merely alive otherwise.
+#[cfg(unix)]
+fn still_same(pid: i32, recorded: Option<u64>) -> bool {
+    match recorded {
+        Some(start) => proc_table::start_time(pid) == Some(start),
+        // SAFETY: signal 0 only checks for existence.
+        None => (unsafe { libc::kill(pid, 0) }) == 0,
+    }
 }
 
 /// Terminate `pids` and the process groups they lead: SIGTERM, then SIGKILL
-/// whatever is still running after `grace`.
+/// whatever is still running after `grace`. A pid whose process has exited
+/// and been reused by another is never signaled.
 #[cfg(unix)]
 pub(crate) async fn terminate_tree(pids: &[i32], grace: std::time::Duration) {
-    // A group leader's whole group (its own children included); anything
-    // else by pid.
-    let targets: Vec<i32> = pids
+    let recorded: Vec<(i32, Option<u64>)> = pids
         .iter()
-        .map(|&pid| {
+        .map(|&pid| (pid, identities::get(pid)))
+        .collect();
+    // A group leader's whole group (its own children included); anything
+    // else by pid. A leader verified now names its group for as long as the
+    // group has members: the kernel never hands out a live group's id.
+    let targets: Vec<(i32, Option<u64>)> = recorded
+        .iter()
+        .filter(|&&(pid, start)| still_same(pid, start))
+        .map(|&(pid, start)| {
             // SAFETY: getpgid only inspects; a vanished pid returns -1.
             if unsafe { libc::getpgid(pid) } == pid {
-                -pid
+                (-pid, start)
             } else {
-                pid
+                (pid, start)
             }
         })
         .collect();
+    // SAFETY: signal 0 only checks for existence.
     let alive = |target: i32| unsafe { libc::kill(target, 0) } == 0;
-    for &target in &targets {
-        crate::send_signal(&target, crate::Signal::Term);
-    }
-    let deadline = tokio::time::Instant::now() + grace;
-    while targets.iter().any(|&t| alive(t)) && tokio::time::Instant::now() < deadline {
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-    }
-    for &target in &targets {
-        if alive(target) {
-            crate::send_signal(&target, crate::Signal::Kill);
+    // The grace can outlast a process; a plain pid is re-verified before
+    // each signal, as it may have been reused in between.
+    let current = |&(target, start): &(i32, Option<u64>)| {
+        if target < 0 {
+            alive(target)
+        } else {
+            still_same(target, start)
+        }
+    };
+    for target in &targets {
+        if current(target) {
+            crate::send_signal(&target.0, crate::Signal::Term);
         }
     }
+    let deadline = tokio::time::Instant::now() + grace;
+    while targets.iter().any(current) && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    for target in &targets {
+        if current(target) {
+            crate::send_signal(&target.0, crate::Signal::Kill);
+        }
+    }
+    identities::forget(pids);
+}
+
+#[cfg(test)]
+#[test]
+fn windows_spawn_retries_only_sharing_failures_and_fresh_images() {
+    use std::io::Error;
+    use std::time::Duration;
+    let fresh = Some(Duration::from_secs(5));
+    let old = Some(Duration::from_secs(3600));
+    assert!(spawn_retryable(&Error::from_raw_os_error(32), old));
+    assert!(spawn_retryable(&Error::from_raw_os_error(33), None));
+    assert!(spawn_retryable(&Error::from_raw_os_error(5), fresh));
+    assert!(!spawn_retryable(&Error::from_raw_os_error(5), old));
+    assert!(!spawn_retryable(&Error::from_raw_os_error(5), None));
+    // ERROR_FILE_NOT_FOUND, ERROR_BAD_EXE_FORMAT: retrying cannot help.
+    assert!(!spawn_retryable(&Error::from_raw_os_error(2), fresh));
+    assert!(!spawn_retryable(&Error::from_raw_os_error(193), fresh));
+    assert_eq!(SPAWN_RETRY_DELAYS.len(), 3);
 }
 
 #[cfg(all(test, unix))]
@@ -149,6 +410,63 @@ mod tests {
         terminate_tree(&tree, std::time::Duration::from_secs(2)).await;
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         assert_ne!(unsafe { libc::kill(shell, 0) }, 0, "orphan ended");
+    }
+
+    #[test]
+    fn proc_stat_fields_survive_hostile_command_names() {
+        // Field 22 (starttime) and 4 (ppid), with a comm holding ") (".
+        let stat = "4242 (evil) (name) S 17 4242 4242 0 -1 4194560 100 0 0 0 1 2 0 0 20 0 1 0 987654 1000 10";
+        assert_eq!(proc_table::parse_stat(stat), Some((17, 987654)));
+        assert_eq!(proc_table::parse_stat("4242 (truncated) S 17"), None);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn native_table_finds_children_with_start_times() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+        let table = proc_table::read();
+        let me = std::process::id() as i32;
+        let entry = table
+            .iter()
+            .find(|entry| entry.pid == pid)
+            .expect("child in the native table");
+        assert_eq!(entry.ppid, me);
+        assert!(entry.start.is_some());
+        assert_eq!(proc_table::start_time(pid), entry.start);
+        assert!(tree_of(me, &table).contains(&pid));
+        child.kill().await.unwrap();
+    }
+
+    /// A pid whose recorded start time no longer matches belongs to some
+    /// other process now: teardown must leave it alone.
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[tokio::test]
+    async fn teardown_skips_a_pid_that_was_reused() {
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let pid = child.id().unwrap() as i32;
+        let start = proc_table::start_time(pid).unwrap();
+        identities::record([(pid, start + 1)]);
+        terminate_tree(&[pid], std::time::Duration::from_millis(200)).await;
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "an impostor pid was signaled"
+        );
+        identities::record([(pid, start)]);
+        terminate_tree(&[pid], std::time::Duration::from_millis(200)).await;
+        let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
+            .await
+            .expect("the verified process is ended")
+            .unwrap();
+        assert!(!status.success());
     }
 
     #[tokio::test]
