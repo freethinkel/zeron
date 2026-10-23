@@ -878,7 +878,7 @@ fn full_registry() -> HarnessRegistry {
     registry.register_lazy(
         HarnessDescriptor {
             id: HarnessId::Muse,
-            name: "Muse".into(),
+            name: "Muse Code".into(),
             supports_steering: true,
             steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: Vec::new(),

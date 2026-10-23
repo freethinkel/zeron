@@ -188,7 +188,7 @@ impl Harness for MuseHarness {
         HarnessId::Muse
     }
     fn display_name(&self) -> &str {
-        "Muse"
+        "Muse Code"
     }
     fn supports_steering(&self) -> bool {
         true

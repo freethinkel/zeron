@@ -166,7 +166,7 @@ pub fn harness_label(id: &str) -> String {
         "cursor" => "Cursor",
         "opencode" => "OpenCode",
         "antigravity" => "Antigravity",
-        "muse" => "Muse",
+        "muse" => "Muse Code",
         "mock" => "Mock",
         other => return other.to_owned(),
     }
