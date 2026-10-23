@@ -348,7 +348,19 @@ impl TurnWire {
             request: serde_json::from_value(request).unwrap(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_millis(50),
-            bus_timeouts: BusTimeouts::default(),
+            // A test stepping a paused clock past the bus's silence bound
+            // would otherwise trip the wedged-server probe, whose answer
+            // (real loopback IO) the stepped clock outruns.
+            bus_timeouts: if overrides["noBusWatchdog"].as_bool() == Some(true) {
+                let never = Duration::from_secs(24 * 3600);
+                BusTimeouts {
+                    silence: never,
+                    probe: never,
+                    wedged: never,
+                }
+            } else {
+                BusTimeouts::default()
+            },
             known_commands: Some(vec![SlashCommand {
                 name: if native_command_reply.is_some() {
                     "project-review"
@@ -2574,7 +2586,7 @@ async fn stalled_prompt_post_has_a_bounded_timeout() {
             true,
             None,
             "2.0.11",
-            json!({"holdPrompt": true}),
+            json!({"holdPrompt": true, "noBusWatchdog": true}),
             false,
         )
         .await;
@@ -2587,11 +2599,17 @@ async fn stalled_prompt_post_has_a_bounded_timeout() {
         // The server never shows the prompt (not running, no message under
         // its id): one retry, then the turn fails instead of spinning. The
         // paused clock is stepped by hand: a timer of the test's own would
-        // fire early while loopback IO is in flight.
+        // fire early while loopback IO is in flight. Each step gives that IO
+        // a moment of real time (a blocking task holds the paused clock
+        // still), or the stepped clock times out a request the fake has not
+        // even read yet.
         tokio::time::pause();
         let mut status = None;
         for _ in 0..200 {
             tokio::time::advance(Duration::from_secs(1)).await;
+            tokio::task::spawn_blocking(|| std::thread::sleep(Duration::from_millis(5)))
+                .await
+                .unwrap();
             while let Ok(event) = wire.events.try_recv() {
                 if let AgentEvent::Done { status: done, .. } = event.unwrap() {
                     status = Some(done);
