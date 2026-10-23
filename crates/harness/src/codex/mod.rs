@@ -948,24 +948,42 @@ async fn setup_failure(
     crate::crash_message("codex app-server", status, stderr_tail)
 }
 
-/// Whether a `thread/resume` failure means the conversation is gone for
-/// good (no rollout on this machine, a thread id Codex never issued), so a
-/// fresh thread is the only way forward. Anything else — a dead process, a
-/// config error — would fail a fresh start too, or lose history needlessly.
-fn resume_unrecoverable(error: &HarnessError) -> bool {
+/// Why a `thread/resume` failure means the conversation is gone for good,
+/// in words for the restore notice: no rollout on this machine, one Codex
+/// can't read (empty, not UTF-8, unparseable — live, 0.164.0: "failed to
+/// read thread: thread-store internal error: …"), a thread id Codex never
+/// issued. A fresh thread is the only way forward then. `None` for anything
+/// else — a dead process, a config error — which would fail a fresh start
+/// too, or lose history needlessly. A bare "not found" is no such sign: an
+/// I/O error ("entity not found"), a missing environment variable or helper
+/// binary say it too.
+fn resume_unrecoverable(error: &HarnessError) -> Option<&'static str> {
     let HarnessError::Protocol(message) = error else {
-        return false;
+        return None;
     };
+    if transport_lost(error) {
+        return None;
+    }
     let message = message.to_ascii_lowercase();
-    !transport_lost(error)
-        && [
-            "no rollout",
-            "not found",
-            "invalid session id",
-            "invalid thread id",
-        ]
-        .iter()
-        .any(|needle| message.contains(needle))
+    let says = |needles: &[&str]| needles.iter().any(|needle| message.contains(needle));
+    if says(&[
+        "no rollout",
+        "thread not found",
+        "session not found",
+        "conversation not found",
+    ]) {
+        Some("it isn't saved on this device")
+    } else if says(&["failed to read thread", "rollout at"]) {
+        Some(if message.contains("is empty") {
+            "its saved history is empty"
+        } else {
+            "its saved history couldn't be read"
+        })
+    } else if says(&["invalid session id", "invalid thread id"]) {
+        Some("Codex doesn't recognize its id")
+    } else {
+        None
+    }
 }
 
 /// `thread/resume`, unarchiving the thread first when Codex reports it
@@ -1422,11 +1440,15 @@ async fn run_session(session: Session) {
         let thread = if let Some(resume) = &request.resume {
             let mut p = start_params.clone();
             p.insert("threadId".into(), Value::String(resume.clone()));
-            match resume_thread(&client, Value::Object(p)).await {
+            match resume_thread(&client, Value::Object(p))
+                .await
+                .map_err(|e| (resume_unrecoverable(&e), e))
+            {
                 Ok(thread) => thread,
-                // A missing/foreign rollout falls back to a fresh thread —
-                // visibly: the reply will not know the earlier conversation.
-                Err(e) if resume_unrecoverable(&e) => {
+                // A missing/unreadable/foreign rollout falls back to a fresh
+                // thread — visibly: the reply will not know the earlier
+                // conversation. The log keeps Codex's own words.
+                Err((Some(reason), e)) => {
                     if command_request(&request.prompt, resume)?.is_some() {
                         return Err(e);
                     }
@@ -1434,10 +1456,6 @@ async fn run_session(session: Session) {
                         target: "zeron_harness::codex",
                         "thread/resume failed (starting fresh): {e}"
                     );
-                    let reason = match &e {
-                        HarnessError::Protocol(message) => message.clone(),
-                        other => other.to_string(),
-                    };
                     restore_notice = Some(format!(
                         "Couldn't restore the earlier Codex conversation ({reason}), so this \
                          reply starts a new one without its context."
@@ -1448,7 +1466,7 @@ async fn run_session(session: Session) {
                 }
                 // A dead process or a refusal a fresh thread would hit too:
                 // fail the run rather than silently dropping its history.
-                Err(e) => return Err(e),
+                Err((None, e)) => return Err(e),
             }
         } else {
             client
@@ -2805,20 +2823,46 @@ mod tests {
     #[test]
     fn only_a_missing_conversation_starts_fresh() {
         let protocol = |m: &str| HarnessError::Protocol(m.into());
-        for gone in [
-            "thread/resume: no rollout found for thread id 019a0000-0000-7000-8000-000000000000",
-            "thread/resume: thread not found: abc",
-            "thread/resume: invalid session id: invalid character: expected an optional prefix of `urn:uuid:`",
+        // Live 0.164.0 wordings, as the RPC client renders them.
+        for (gone, reason) in [
+            (
+                "thread/resume: no rollout found for thread id 019a0000-0000-7000-8000-000000000000 (code -32600)",
+                "it isn't saved on this device",
+            ),
+            (
+                "thread/resume: thread not found: abc",
+                "it isn't saved on this device",
+            ),
+            (
+                "thread/resume: failed to read thread: thread-store internal error: failed to read session metadata /h/sessions/2026/10/23/rollout-x.jsonl: rollout at /h/sessions/2026/10/23/rollout-x.jsonl is empty (code -32603)",
+                "its saved history is empty",
+            ),
+            (
+                "thread/resume: failed to read thread: thread-store internal error: failed to read session metadata /h/sessions/2026/10/23/rollout-x.jsonl: stream did not contain valid UTF-8 (code -32603)",
+                "its saved history couldn't be read",
+            ),
+            (
+                "thread/resume: invalid session id: invalid character: expected an optional prefix of `urn:uuid:` (code -32600)",
+                "Codex doesn't recognize its id",
+            ),
         ] {
-            assert!(resume_unrecoverable(&protocol(gone)), "{gone}");
+            assert_eq!(
+                resume_unrecoverable(&protocol(gone)),
+                Some(reason),
+                "{gone}"
+            );
         }
         for keep in [
             "thread/resume: app-server exited before responding",
             "thread/resume: app-server stdin closed",
             "thread/resume: failed to load configuration",
             "thread/resume: session x is archived. Run `codex unarchive x` to unarchive it first.",
+            // "not found" alone is about something other than the thread.
+            "thread/resume: failed to open /repo/AGENTS.md: entity not found (code -32603)",
+            "thread/resume: environment variable not found: MY_PROVIDER_KEY (code -32603)",
+            "thread/resume: model provider `corp` not found (code -32600)",
         ] {
-            assert!(!resume_unrecoverable(&protocol(keep)), "{keep}");
+            assert_eq!(resume_unrecoverable(&protocol(keep)), None, "{keep}");
         }
         assert!(transport_lost(&protocol(
             "thread/start: app-server exited before responding"
@@ -2827,9 +2871,12 @@ mod tests {
         assert!(transport_lost(&protocol(
             "thread/resume: app-server stdin closed (Broken pipe (os error 32))"
         )));
-        assert!(!resume_unrecoverable(&protocol(
-            "thread/resume: app-server stdin closed (Broken pipe (os error 32))"
-        )));
+        assert_eq!(
+            resume_unrecoverable(&protocol(
+                "thread/resume: app-server stdin closed (Broken pipe (os error 32))"
+            )),
+            None
+        );
         assert!(!transport_lost(&protocol("thread/start: bad request")));
     }
 

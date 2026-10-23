@@ -763,44 +763,53 @@ async fn turn_failed_maps_to_errored_done() {
     );
 }
 
+/// A missing rollout, and an empty one (unreadable for good), both resume
+/// as a fresh thread with a plain-words notice.
 #[tokio::test]
 async fn resume_falls_back_to_fresh_thread() {
-    let (controls, _steer, _token) = controls("Yes");
-    let mut req = request("scenario:resumed");
-    req.resume = Some("resume-fail".into());
-    let events = run_to_end(&harness(), req, controls).await;
+    for (resume, reason) in [
+        ("resume-fail", "it isn't saved on this device"),
+        ("resume-empty", "its saved history is empty"),
+    ] {
+        let (controls, _steer, _token) = controls("Yes");
+        let mut req = request("scenario:resumed");
+        req.resume = Some(resume.into());
+        let events = run_to_end(&harness(), req, controls).await;
 
-    assert!(
-        events.iter().any(|e| matches!(
-            e,
-            AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh"
-        )),
-        "fresh thread expected: {events:?}"
-    );
-    // The lost context is said out loud, once, in the new reply.
-    let notices: Vec<_> = events
-        .iter()
-        .filter_map(|e| match e {
-            AgentEvent::Error { message } => Some(message.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(notices.len(), 1, "{events:?}");
-    assert!(
-        notices[0].starts_with("Couldn't restore the earlier Codex conversation"),
-        "{}",
-        notices[0]
-    );
-    assert_eq!(zeron_proto::run_errors::provider_problem(notices[0]), None);
-    assert_eq!(
-        events.last(),
-        Some(&AgentEvent::Done {
-            status: DoneStatus::Completed,
-            result: None,
-            error: None,
-            session_id: Some("th-fresh".into()),
-        })
-    );
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                AgentEvent::SessionStarted { session_id, .. } if session_id == "th-fresh"
+            )),
+            "fresh thread expected: {events:?}"
+        );
+        // The lost context is said out loud, once, in the new reply.
+        let notices: Vec<_> = events
+            .iter()
+            .filter_map(|e| match e {
+                AgentEvent::Error { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(notices.len(), 1, "{events:?}");
+        assert_eq!(
+            notices[0],
+            format!(
+                "Couldn't restore the earlier Codex conversation ({reason}), so this reply \
+                 starts a new one without its context."
+            )
+        );
+        assert_eq!(zeron_proto::run_errors::provider_problem(notices[0]), None);
+        assert_eq!(
+            events.last(),
+            Some(&AgentEvent::Done {
+                status: DoneStatus::Completed,
+                result: None,
+                error: None,
+                session_id: Some("th-fresh".into()),
+            })
+        );
+    }
 }
 
 #[tokio::test]

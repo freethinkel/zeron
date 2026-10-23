@@ -79,6 +79,13 @@ if has "$line" '"method":"thread/resume"'; then
     read -r line || exit 1
     has "$line" '"method":"thread/start"' || exit 1
     emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-fresh\"}}}"
+  elif has "$line" '"threadId":"resume-empty"'; then
+    # An empty rollout file (live 0.164.0 wording): unreadable for good, so
+    # the same fresh-start fallback.
+    emit "{\"id\":$(rid "$line"),\"error\":{\"code\":-32603,\"message\":\"failed to read thread: thread-store internal error: failed to read session metadata /h/sessions/2026/10/23/rollout-2026-10-23T10-00-00-resume-empty.jsonl: rollout at /h/sessions/2026/10/23/rollout-2026-10-23T10-00-00-resume-empty.jsonl is empty\"}}"
+    read -r line || exit 1
+    has "$line" '"method":"thread/start"' || exit 1
+    emit "{\"id\":$(rid "$line"),\"result\":{\"thread\":{\"id\":\"th-fresh\"}}}"
   elif has "$line" '"threadId":"resume-archived"'; then
     # Archived (live 0.164.0 wording): expect thread/unarchive, then the
     # resume again.
