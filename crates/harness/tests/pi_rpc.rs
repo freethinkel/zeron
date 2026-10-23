@@ -821,6 +821,33 @@ async fn compaction_after_the_settle_barrier_still_ends_the_turn() {
     assert_eq!(dones, [DoneStatus::Completed], "{events:?}");
 }
 
+/// Pi idle with input it never starts has no settle event coming: the turn
+/// settles at the bound instead of staying Working.
+#[tokio::test]
+async fn idle_with_queued_input_settles_at_the_bound() {
+    let dir = tempfile::tempdir().unwrap();
+    let (c, tx, _) = controls();
+    drop(tx);
+    let stream = harness()
+        .with_idle_queue_timeout(Duration::from_millis(600))
+        .with_session_store(dir.path().join("index"))
+        .run(request(dir.path(), "stranded"), c)
+        .await
+        .unwrap();
+    let events: Vec<_> =
+        tokio::time::timeout(Duration::from_secs(5), stream.map(Result::unwrap).collect())
+            .await
+            .expect("the turn settled");
+    let dones: Vec<_> = events
+        .iter()
+        .filter_map(|e| match e {
+            AgentEvent::Done { status, .. } => Some(*status),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(dones, [DoneStatus::Completed], "{events:?}");
+}
+
 #[tokio::test]
 async fn extension_errors_and_stdout_noise_do_not_fail_the_turn() {
     for prompt in ["ext-error", "noise"] {

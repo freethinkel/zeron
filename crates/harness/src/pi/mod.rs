@@ -29,6 +29,11 @@ const STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
 /// Bound on applying a mid-session model or thinking change (several
 /// queries, one of which lists the available models).
 const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(30);
+/// How long an idle Pi may hold queued input before the turn settles as it
+/// stands. Pi starts queued input at once; input it leaves queued while idle
+/// has no settle event coming, so the barrier is re-polled until this bound.
+const IDLE_QUEUE_TIMEOUT: Duration = Duration::from_secs(15);
+const IDLE_QUEUE_POLL: Duration = Duration::from_millis(250);
 
 pub struct PiHarness {
     models_cache: crate::catalog::Catalog,
@@ -38,6 +43,7 @@ pub struct PiHarness {
     executable: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    idle_queue_timeout: Duration,
 }
 impl Default for PiHarness {
     fn default() -> Self {
@@ -49,6 +55,7 @@ impl Default for PiHarness {
             workspace_commands: Default::default(),
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            idle_queue_timeout: IDLE_QUEUE_TIMEOUT,
         }
     }
 }
@@ -73,6 +80,12 @@ impl PiHarness {
     pub fn with_graces(mut self, interrupt: Duration, kill: Duration) -> Self {
         self.interrupt_grace = interrupt;
         self.kill_grace = kill;
+        self
+    }
+    /// Tune the idle-with-queued-input bound (tests shrink it; default 15s).
+    #[doc(hidden)]
+    pub fn with_idle_queue_timeout(mut self, timeout: Duration) -> Self {
+        self.idle_queue_timeout = timeout;
         self
     }
     pub fn resolve_executable(&self) -> Result<PathBuf, HarnessError> {
@@ -383,6 +396,7 @@ impl Harness for PiHarness {
         let (tx, rx) = mpsc::channel(256);
         let kill_grace = self.kill_grace;
         let interrupt_grace = self.interrupt_grace;
+        let idle_queue_timeout = self.idle_queue_timeout;
         tokio::spawn(async move {
             let mut runner = Runner {
                 store,
@@ -405,6 +419,9 @@ impl Harness for PiHarness {
                 lost_context,
                 recheck_state: false,
                 state_deadline: None,
+                idle_queue_timeout,
+                idle_queue_deadline: None,
+                idle_poll: None,
             };
             // The lease lives through shutdown even if the consumer drops its stream.
             let RunControls {
@@ -489,6 +506,12 @@ struct Runner {
     recheck_state: bool,
     /// When an outstanding state query gives up (see STATE_QUERY_TIMEOUT).
     state_deadline: Option<tokio::time::Instant>,
+    idle_queue_timeout: Duration,
+    /// Since the barrier first found Pi idle with input queued: past it the
+    /// turn settles as it stands (see IDLE_QUEUE_TIMEOUT).
+    idle_queue_deadline: Option<tokio::time::Instant>,
+    /// The next re-poll of that idle state.
+    idle_poll: Option<tokio::time::Instant>,
 }
 impl Runner {
     async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
@@ -513,6 +536,8 @@ impl Runner {
             return Ok(());
         }
         self.active = false;
+        self.idle_queue_deadline = None;
+        self.idle_poll = None;
         self.process.dialogs.cancel(&self.process.transport.client);
         self.emit(AgentEvent::Done {
             status: if self.interrupted {
@@ -782,6 +807,7 @@ impl Runner {
                 self.state_deadline = None;
             }
             let state_deadline = self.state_deadline;
+            let idle_poll = self.idle_poll;
             tokio::select! {
                 incoming=self.process.next()=>self.frame(incoming?).await?,
                 steer=steering.recv(),if open=>match steer {Some(steer)=>self.queued.push_back(steer),None=>open=false},
@@ -792,6 +818,14 @@ impl Runner {
                         "Pi did not answer a state query within {}s",
                         STATE_QUERY_TIMEOUT.as_secs()
                     )));
+                }
+                _ = tokio::time::sleep_until(idle_poll.unwrap_or_else(tokio::time::Instant::now)),
+                    if idle_poll.is_some() =>
+                {
+                    self.idle_poll = None;
+                    if self.active {
+                        self.query_state(json!({"type":"get_state"}), Pending::Barrier(self.epoch))?;
+                    }
                 }
             }
         }
@@ -845,6 +879,7 @@ impl Runner {
         let id = self.process.transport.client.request(command)?;
         self.pending.insert(id, pending);
         self.state_deadline = Some(tokio::time::Instant::now() + STATE_QUERY_TIMEOUT);
+        self.idle_poll = None;
         Ok(())
     }
     /// Pi refused a submission: a steer it would not take, a failed command.
@@ -906,13 +941,32 @@ impl Runner {
         }
         // Busy: the next agent_settled normally re-checks. Compaction and
         // automatic retries can end without one, so remember to re-check
-        // when they end (see `frame`). Queued input means work is coming.
-        if data["isStreaming"] != false
-            || data["isCompacting"] != false
-            || data["pendingMessageCount"].as_u64().is_some_and(|n| n > 0)
-        {
+        // when they end (see `frame`).
+        let busy = data["isStreaming"] != false || data["isCompacting"] != false;
+        let queued = data["pendingMessageCount"].as_u64().unwrap_or(0);
+        if busy {
+            self.idle_queue_deadline = None;
             self.recheck_state = true;
             return Ok(());
+        }
+        if queued > 0 {
+            // Idle, yet input queued: Pi normally starts it at once, and that
+            // run settles. Input it leaves queued has no event coming, so poll
+            // the barrier, and past the bound settle as the turn stands.
+            let now = tokio::time::Instant::now();
+            let deadline = *self
+                .idle_queue_deadline
+                .get_or_insert(now + self.idle_queue_timeout);
+            if now < deadline {
+                self.recheck_state = true;
+                self.idle_poll = Some(now + IDLE_QUEUE_POLL);
+                return Ok(());
+            }
+            tracing::warn!(
+                queued,
+                "Pi stayed idle with input queued for {:?}; settling the turn",
+                self.idle_queue_timeout
+            );
         }
         self.recheck_state = false;
         if file.is_some_and(|p| {

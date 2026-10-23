@@ -68,6 +68,8 @@ fn main() {
     let abort = Arc::new(AtomicBool::new(false));
     let steering_all = Arc::new(AtomicBool::new(false));
     let compacting = Arc::new(AtomicBool::new(false));
+    // Input Pi left queued while idle: reported, never started.
+    let stranded = Arc::new(AtomicBool::new(false));
     let mut dialog = None;
     let mut model = "mock".to_string();
     let mut thinking = "medium".to_string();
@@ -76,7 +78,7 @@ fn main() {
         match v["type"].as_str().unwrap_or("") {
             "get_state" => response(
                 &v,
-                json!({"sessionId":session,"sessionFile":file,"isStreaming":active.load(Ordering::SeqCst),"isCompacting":compacting.load(Ordering::SeqCst),"model":{"id":model,"provider":"mock","contextWindow":128000},"thinkingLevel":thinking}),
+                json!({"sessionId":session,"sessionFile":file,"isStreaming":active.load(Ordering::SeqCst),"isCompacting":compacting.load(Ordering::SeqCst),"pendingMessageCount":u64::from(stranded.load(Ordering::SeqCst)),"model":{"id":model,"provider":"mock","contextWindow":128000},"thinkingLevel":thinking}),
             ),
             "get_available_models" => response(
                 &v,
@@ -166,6 +168,7 @@ fn main() {
                 let queue = queue.clone();
                 let steering_all = steering_all.clone();
                 let compacting = compacting.clone();
+                let stranded = stranded.clone();
                 std::thread::spawn(move || {
                     let mut text = text;
                     loop {
@@ -254,6 +257,9 @@ fn main() {
                             }
                             text = batch.join("\n");
                             continue;
+                        }
+                        if text == "stranded" {
+                            stranded.store(true, Ordering::SeqCst);
                         }
                         active.store(false, Ordering::SeqCst);
                         if text == "compact-tail" {
