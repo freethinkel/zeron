@@ -427,8 +427,6 @@ impl ClaudeHarness {
     }
 
     async fn probe_initialize(&self, cwd: Option<&std::path::Path>) -> Result<Value, HarnessError> {
-        /// A cold start on Windows or behind Bedrock can take well over 10s.
-        const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
         let exe = self.resolve_executable()?;
         let mut cmd = Command::new(&exe);
         if let Some(cwd) = cwd {
@@ -522,9 +520,10 @@ impl ClaudeHarness {
                 )))
             }
             Ok(Err(error)) => Err(error),
-            Err(_) => Err(HarnessError::Protocol(format!(
-                "Claude initialize timed out after {}s",
-                PROBE_TIMEOUT.as_secs()
+            // A CLI stuck on its own startup (an auth prompt, a broken
+            // config) usually says so on stderr.
+            Err(_) => Err(HarnessError::Protocol(probe_timeout_message(
+                stderr_tail.snapshot(),
             ))),
         };
         // EOF first (the `discovery` borrow has ended): Windows' teardown
@@ -533,6 +532,22 @@ impl ClaudeHarness {
         drop(stdin);
         child.shutdown(self.kill_grace).await;
         result
+    }
+}
+
+/// How long the discovery probe waits: a cold start on Windows or behind
+/// Bedrock can take well over 10s.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(25);
+
+/// The discovery probe's timeout, with what the CLI printed (redacted).
+fn probe_timeout_message(stderr: Option<String>) -> String {
+    let timed_out = format!(
+        "Claude initialize timed out after {}s",
+        PROBE_TIMEOUT.as_secs()
+    );
+    match stderr {
+        Some(tail) => format!("{timed_out}: {}", crate::redact_secrets(&tail)),
+        None => timed_out,
     }
 }
 
@@ -1792,6 +1807,26 @@ fn updated_input_with_answers(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn probe_timeout_says_what_the_cli_printed_without_its_secrets() {
+        let message = probe_timeout_message(Some(
+            "Invalid API key sk-ant-secret-value\nPlease run /login".into(),
+        ));
+        assert!(
+            message.starts_with("Claude initialize timed out after"),
+            "{message}"
+        );
+        assert!(message.contains("Please run /login"), "{message}");
+        assert!(!message.contains("secret-value"), "{message}");
+        assert_eq!(
+            probe_timeout_message(None),
+            format!(
+                "Claude initialize timed out after {}s",
+                PROBE_TIMEOUT.as_secs()
+            )
+        );
+    }
 
     #[test]
     fn parses_questions_tolerantly() {

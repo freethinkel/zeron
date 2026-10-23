@@ -506,7 +506,7 @@ pub(crate) fn describe_exit(status: Option<std::process::ExitStatus>) -> String 
 }
 
 /// Remove recognizable credentials at the boundary where diagnostics become UI text.
-fn redact_secrets(text: &str) -> String {
+pub(crate) fn redact_secrets(text: &str) -> String {
     let lower = text.to_ascii_lowercase();
     let markers = ["bearer ", "basic ", "sk-", "ghp_", "xox", "api_key="];
     let mut result = String::new();
