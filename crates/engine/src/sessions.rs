@@ -1043,6 +1043,10 @@ impl SessionsEngine {
             }
             return Ok(String::new());
         }
+        // A new turn: a Stop's mark belongs to the one before it.
+        if !idle {
+            self.inner.journal.clear_user_stop(chat_id);
+        }
         runs.insert(
             chat_id.to_string(),
             RunHandle {
@@ -1342,14 +1346,24 @@ impl SessionsEngine {
 
     /// A Stop from the user, noted before it looks for the run to stop: it
     /// is counted (see `Inner::user_stops`), and the turn it stops is no
-    /// longer the shutdown's to revive.
+    /// longer the shutdown's to revive — nor the next boot's: the stopped
+    /// run can take seconds to settle and close its journal, and an engine
+    /// that dies in between must not read the stopped turn as a crashed one
+    /// ([`RunJournal::note_user_stop`]; cleared when the journal closes the
+    /// turn, or the next turn starts).
     fn note_user_stop(&self, chat_id: &str) {
         *lock(&self.inner.user_stops)
             .entry(chat_id.to_string())
             .or_default() += 1;
-        if let Some(run) = lock(&self.inner.runs).get(chat_id) {
+        let live = if let Some(run) = lock(&self.inner.runs).get(chat_id) {
             run.shutdown_cut
                 .store(false, std::sync::atomic::Ordering::Release);
+            true
+        } else {
+            false
+        };
+        if live && self.turn_in_flight(chat_id) {
+            self.inner.journal.note_user_stop(chat_id);
         }
     }
 
@@ -1496,8 +1510,9 @@ impl SessionsEngine {
     /// read it twice and redo finished side effects (commits, edits).
     /// Otherwise the original prompt, which never reached it. Never revived:
     /// native commands (`/compact`, `/review` are maintenance, not work to
-    /// carry on), a turn parked on an unanswered question, and a turn that
-    /// had already finished.
+    /// carry on), a turn parked on an unanswered question, a turn that had
+    /// already finished, and one the user had stopped (its run had not
+    /// settled yet when the engine died).
     pub fn recover_stale(&self) -> Result<usize, EngineError> {
         const MAX_AUTO_RESUME: u32 = 3;
         const RESUME_FRESH_MS: i64 = 12 * 60 * 60 * 1000;
@@ -1530,6 +1545,10 @@ impl SessionsEngine {
                 continue; // a live run owns this journal
             }
             let crashed = shutdown_at.is_none();
+            // The user had stopped the turn: the engine died before the
+            // stopped run closed its journal.
+            let stopped = self.inner.journal.user_stopped(&chat_id);
+            self.inner.journal.clear_user_stop(&chat_id);
             let handle = self.doc_handle(&chat_id)?;
             // Harness continuity first: the crashed run's session id may only
             // exist in the journal (the debounced workspace-row write may
@@ -1592,6 +1611,7 @@ impl SessionsEngine {
             let pickup = match &request {
                 Some((_, harness_id))
                     if fresh
+                        && !stopped
                         && !(crashed && tail.finished)
                         && prompt
                             .as_ref()
@@ -1898,6 +1918,11 @@ impl Inner {
                 0
             }
         };
+        // The journal now closes the turn a Stop marked (see
+        // `SessionsEngine::note_user_stop`).
+        if matches!(event, AgentEvent::Done { .. }) {
+            self.journal.clear_user_stop(chat_id);
+        }
         if let Some(hub) = lock(&self.hubs).get(chat_id) {
             let _ = hub.send(JournaledEvent {
                 seq,

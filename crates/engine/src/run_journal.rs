@@ -78,6 +78,10 @@ impl RunJournal {
         self.dir.join(format!("{}.shutdown", sanitize_id(chat_id)))
     }
 
+    fn stop_path(&self, chat_id: &str) -> PathBuf {
+        self.dir.join(format!("{}.stopped", sanitize_id(chat_id)))
+    }
+
     /// Auto-resume revival budget (zeron `resumeAttempt`/`MAX_AUTO_RESUME`):
     /// persisted beside the journal so a run that CRASHES THE ENGINE cannot
     /// revive itself in an infinite boot loop. Stored as `{count} {last_ms}`;
@@ -138,6 +142,25 @@ impl RunJournal {
 
     pub fn clear_shutdown_interrupt(&self, chat_id: &str) {
         let _ = std::fs::remove_file(self.shutdown_path(chat_id));
+    }
+
+    /// Mark a chat whose turn the user stopped. Its journal closes only once
+    /// the stopped run settles (seconds later, for a harness slow to let
+    /// go): an engine that dies in between leaves a journal that reads as a
+    /// crash, and this marker keeps the next boot from reviving the turn.
+    pub fn note_user_stop(&self, chat_id: &str) {
+        if let Err(err) = std::fs::write(self.stop_path(chat_id), b"") {
+            tracing::warn!(chat = %chat_id, error = %err, "stop marker write failed");
+        }
+    }
+
+    /// Whether [`Self::note_user_stop`] marked the chat's last turn.
+    pub fn user_stopped(&self, chat_id: &str) -> bool {
+        self.stop_path(chat_id).exists()
+    }
+
+    pub fn clear_user_stop(&self, chat_id: &str) {
+        let _ = std::fs::remove_file(self.stop_path(chat_id));
     }
 
     /// A cleanly completed turn resets the budget — only consecutive

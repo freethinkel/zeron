@@ -191,6 +191,8 @@ enum OnInterrupt {
     End,
     /// The turn finishes just then: a completed `Done`.
     Finish,
+    /// Nothing: the engine waits out its grace period.
+    Ignore,
 }
 
 #[async_trait]
@@ -238,6 +240,7 @@ impl Harness for HoldingHarness {
                         session_id: Some("hs-held".into()),
                     }));
                 }
+                OnInterrupt::Ignore => std::future::pending::<()>().await,
             }
         });
         Ok(futures::stream::unfold(
@@ -1270,4 +1273,51 @@ async fn a_revival_yields_to_a_message_sent_while_it_was_on_its_way() {
     );
     assert_eq!(log[0].prompt, "something else");
     core.shutdown().await;
+}
+
+#[test]
+fn a_stop_the_engine_dies_before_settling_is_not_revived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    {
+        let engine = tokio::runtime::Runtime::new().unwrap();
+        engine.block_on(async {
+            // A harness slow to let go: the stopped run settles only after
+            // its grace period.
+            let core = assemble(
+                &dir,
+                HoldingHarness {
+                    ask: false,
+                    on_interrupt: OnInterrupt::Ignore,
+                },
+            );
+            let core = hold_a_turn_in(core, false).await;
+            let sessions = core.sessions.clone();
+            tokio::spawn(async move { sessions.interrupt(CHAT).await });
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            core.doc_host.flush_all();
+            drop(core);
+        });
+        // The engine dies before the stopped run has closed its journal.
+        engine.shutdown_timeout(Duration::from_millis(100));
+    }
+    assert!(
+        journal(&dir)
+            .stale_sessions()
+            .unwrap()
+            .contains(&CHAT.to_string()),
+        "the journal reads like a crash"
+    );
+
+    let engine = tokio::runtime::Runtime::new().unwrap();
+    engine.block_on(async {
+        let requests: RequestLog = Default::default();
+        let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+        settle().await;
+        assert!(
+            requests.lock().unwrap().is_empty(),
+            "a Stop is never undone"
+        );
+        core.shutdown().await;
+    });
 }
