@@ -187,7 +187,7 @@ impl Command {
                     };
                     tracing::debug!(%error, image = %launched.display(), "retrying agent launch");
                     // Rare and short; callers are synchronous by signature.
-                    std::thread::sleep(delay);
+                    super::sleep_off_runtime(delay);
                 }
                 result => return result,
             }

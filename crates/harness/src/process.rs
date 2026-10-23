@@ -19,6 +19,21 @@ const SPAWN_RETRY_DELAYS: [std::time::Duration; 3] = [
     std::time::Duration::from_millis(1000),
 ];
 
+/// Sleep in a synchronous caller without stalling the async runtime it may
+/// run on: a multi-thread runtime's worker hands its other tasks off first
+/// (`block_in_place`). Outside a runtime, on a current-thread runtime (whose
+/// only thread would block regardless) or on a blocking-pool thread, a plain
+/// sleep.
+#[cfg(any(windows, test))]
+fn sleep_off_runtime(delay: std::time::Duration) {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread => {
+            tokio::task::block_in_place(|| std::thread::sleep(delay));
+        }
+        _ => std::thread::sleep(delay),
+    }
+}
+
 /// Whether a failed Windows process creation is worth retrying: a sharing
 /// or lock violation on the image, or access denied on one modified in the
 /// last minute (the malware scanner holding a CLI that just updated).
@@ -334,6 +349,42 @@ pub(crate) async fn terminate_tree(tracked: &[Tracked], grace: std::time::Durati
             crate::send_signal(&target.0, crate::Signal::Kill);
         }
     }
+}
+
+/// A retry's wait leaves a multi-thread runtime's other tasks running, and
+/// is safe wherever a synchronous spawn can be called from.
+#[cfg(test)]
+#[test]
+fn a_spawn_retry_wait_does_not_stall_the_runtime() {
+    use std::time::Duration;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(1)
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let ticker = tokio::spawn(async {
+            let mut ticks = 0;
+            for _ in 0..5 {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                ticks += 1;
+            }
+            ticks
+        });
+        // On the runtime's only worker: without the hand-off the ticker
+        // could not run until the wait was over.
+        tokio::spawn(async { sleep_off_runtime(Duration::from_millis(400)) });
+        let ticks = tokio::time::timeout(Duration::from_millis(300), ticker).await;
+        assert_eq!(ticks.ok().and_then(Result::ok), Some(5));
+        tokio::task::spawn_blocking(|| sleep_off_runtime(Duration::from_millis(1)))
+            .await
+            .unwrap();
+    });
+    tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap()
+        .block_on(async { sleep_off_runtime(Duration::from_millis(1)) });
+    sleep_off_runtime(Duration::from_millis(1));
 }
 
 #[cfg(test)]
