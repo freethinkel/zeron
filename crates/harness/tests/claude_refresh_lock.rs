@@ -15,6 +15,7 @@ case "$*" in
   *) echo "2.1.309 (Claude Code)"; exit 0 ;;
 esac
 trap 'echo term >> "$dir/events"; exit 0' TERM
+: > "$dir/ready"
 read line
 echo '{"type":"control_response","response":{"subtype":"success","request_id":"zeron-command-probe","response":{"commands":[{"name":"review","description":"Review"}]}}}'
 while read line; do :; done
@@ -109,7 +110,14 @@ async fn a_run_is_torn_down_only_once_no_login_refresh_is_in_flight() {
         .run(request, controls)
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    // Hang up only once the CLI listens for SIGTERM: a signal that beats
+    // the trap (a loaded machine) would end it without a trace.
+    for _ in 0..200 {
+        if dir.path().join("ready").exists() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
     drop(stream);
 
     tokio::time::sleep(Duration::from_millis(800)).await;
