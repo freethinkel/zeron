@@ -138,16 +138,23 @@ impl Harness for ScriptedHarness {
     }
 }
 
-/// A [`ScriptedHarness`] registered as another provider.
-struct AsProvider(HarnessId, ScriptedHarness);
+/// A [`ScriptedHarness`] registered as `id`, launching the CLI at `cli`.
+struct AsProvider {
+    id: HarnessId,
+    cli: Option<std::path::PathBuf>,
+    script: ScriptedHarness,
+}
 
 #[async_trait]
 impl Harness for AsProvider {
     fn id(&self) -> HarnessId {
-        self.0
+        self.id
     }
     fn display_name(&self) -> &str {
-        self.0.as_str()
+        self.id.as_str()
+    }
+    fn executable_path(&self) -> Option<std::path::PathBuf> {
+        self.cli.clone()
     }
     fn supports_steering(&self) -> bool {
         false
@@ -166,7 +173,7 @@ impl Harness for AsProvider {
         request: RunRequest,
         controls: RunControls,
     ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
-        self.1.run(request, controls).await
+        self.script.run(request, controls).await
     }
 }
 
@@ -818,26 +825,46 @@ async fn a_signed_out_local_engine_still_revives_after_shutdown() {
     core.shutdown().await;
 }
 
+/// A harness whose first `failures` starts are refused with `kind`, run
+/// from the CLI at `cli`.
+fn refusing(
+    requests: &RequestLog,
+    kind: std::io::ErrorKind,
+    failures: usize,
+    cli: Option<std::path::PathBuf>,
+) -> AsProvider {
+    AsProvider {
+        id: HarnessId::Mock,
+        cli,
+        script: ScriptedHarness {
+            requests: requests.clone(),
+            script: Arc::new(move |request, call| {
+                if call < failures {
+                    Err(HarnessError::Io(std::io::Error::from(kind)))
+                } else {
+                    Ok(completed_turn("hs-1", &format!("ack: {}", request.prompt)))
+                }
+            }),
+        },
+    }
+}
+
 #[tokio::test]
 async fn a_transient_start_failure_retries_with_backoff() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data_dir(&tmp);
     let requests: RequestLog = Default::default();
     // Antivirus holding a freshly updated CLI: two refused spawns.
+    let cli = tmp.path().join("mock-cli");
+    std::fs::write(&cli, b"updated just now").unwrap();
     let core = assemble(
         &dir,
-        ScriptedHarness {
-            requests: requests.clone(),
-            script: Arc::new(|request, call| {
-                if call < 2 {
-                    Err(HarnessError::Io(std::io::Error::from(
-                        std::io::ErrorKind::PermissionDenied,
-                    )))
-                } else {
-                    Ok(completed_turn("hs-1", &format!("ack: {}", request.prompt)))
-                }
-            }),
-        },
+        refusing(
+            &requests,
+            std::io::ErrorKind::PermissionDenied,
+            2,
+            Some(cli),
+        ),
     );
     pre_title(&core);
     queue_run(&core, "hello", "msg-user-1");
@@ -850,6 +877,42 @@ async fn a_transient_start_failure_retries_with_backoff() {
     let entries = entries_now(&core);
     assert_eq!(entries.len(), 2, "one user entry, one reply: {entries:#?}");
     assert!(error_notes(&entries[1]).is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_refused_permission_without_a_fresh_cli_surfaces_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    // A CLI that lost its execute bit, untouched for a day: no retry fixes it.
+    let cli = tmp.path().join("mock-cli");
+    let file = std::fs::File::create(&cli).unwrap();
+    file.set_modified(std::time::SystemTime::now() - Duration::from_secs(24 * 60 * 60))
+        .unwrap();
+    drop(file);
+    let core = assemble(
+        &dir,
+        refusing(
+            &requests,
+            std::io::ErrorKind::PermissionDenied,
+            usize::MAX,
+            Some(cli),
+        ),
+    );
+    pre_title(&core);
+    queue_run(&core, "hello", "msg-user-1");
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Errored)
+        },
+        "the start failure to surface",
+    )
+    .await;
+    settle().await;
+    assert_eq!(requests.lock().unwrap().len(), 1, "no retry");
     core.shutdown().await;
 }
 
@@ -941,9 +1004,10 @@ async fn a_rejected_resume_in_a_switched_chat_starts_fresh_and_says_so() {
     let registry = HarnessRegistry::new();
     registry.register(Arc::new(ScriptedHarness::completing(&mock_log, "hs-mock")));
     // Pi's first session is lost after a while; every later one sticks.
-    registry.register(Arc::new(AsProvider(
-        HarnessId::Pi,
-        ScriptedHarness {
+    registry.register(Arc::new(AsProvider {
+        id: HarnessId::Pi,
+        cli: None,
+        script: ScriptedHarness {
             requests: pi_log.clone(),
             script: Arc::new(|request, call| {
                 Ok(match (call, request.resume.as_deref()) {
@@ -958,7 +1022,7 @@ async fn a_rejected_resume_in_a_switched_chat_starts_fresh_and_says_so() {
                 })
             }),
         },
-    )));
+    }));
     let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::Mock, None)
         .expect("engine core assembles");
     pre_title(&core);

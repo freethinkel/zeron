@@ -2764,22 +2764,41 @@ const SPAWN_RETRY_DELAYS: [std::time::Duration; 3] = [
 /// spawn for a moment (antivirus holding a freshly updated CLI on Windows,
 /// `ETXTBSY` while an update rewrites it, a busy or interrupted call).
 /// Deterministic failures — not installed, not signed in, protocol errors —
-/// surface at once.
-fn transient_start_failure(err: &zeron_harness::HarnessError) -> bool {
+/// surface at once. A refused permission is both: a CLI without its execute
+/// bit fails that way forever, so it counts only when the harness's CLI was
+/// rewritten moments ago (`cli_just_replaced`, see
+/// [`cli_replaced_recently`]).
+fn transient_start_failure(err: &zeron_harness::HarnessError, cli_just_replaced: bool) -> bool {
     use std::io::ErrorKind;
     let zeron_harness::HarnessError::Io(err) = err else {
         return false;
     };
-    matches!(
-        err.kind(),
-        ErrorKind::PermissionDenied
-            | ErrorKind::ResourceBusy
-            | ErrorKind::ExecutableFileBusy
-            | ErrorKind::WouldBlock
-            | ErrorKind::Interrupted
-    )
+    match err.kind() {
+        ErrorKind::PermissionDenied => cli_just_replaced,
+        ErrorKind::ResourceBusy
+        | ErrorKind::ExecutableFileBusy
+        | ErrorKind::WouldBlock
+        | ErrorKind::Interrupted => true,
         // ERROR_SHARING_VIOLATION / ERROR_LOCK_VIOLATION have no kind of their own.
-        || (cfg!(windows) && matches!(err.raw_os_error(), Some(32 | 33)))
+        _ => cfg!(windows) && matches!(err.raw_os_error(), Some(32 | 33)),
+    }
+}
+
+/// How recently a harness's CLI must have been rewritten for a refused
+/// spawn to be read as the update still settling.
+const CLI_REPLACED_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Whether `harness`'s CLI was modified within [`CLI_REPLACED_WINDOW`] (an
+/// update, by its own updater or the engine's, that the OS or antivirus is
+/// still holding). A harness without a CLI, or one that can't be read,
+/// never was.
+fn cli_replaced_recently(harness: &dyn Harness) -> bool {
+    harness
+        .executable_path()
+        .and_then(|path| std::fs::metadata(path).ok())
+        .and_then(|metadata| metadata.modified().ok())
+        .and_then(|modified| modified.elapsed().ok())
+        .is_some_and(|age| age < CLI_REPLACED_WINDOW)
 }
 
 /// Whether a failed start says the provider no longer has the session it
@@ -3371,6 +3390,19 @@ async fn drive_run(
         }
         Err(error) => Err(error),
     };
+    // Only a refused permission needs to know (a filesystem read, kept off
+    // the async threads like `binary_identity`).
+    let cli_just_replaced = match &started {
+        Err(zeron_harness::HarnessError::Io(err))
+            if err.kind() == std::io::ErrorKind::PermissionDenied =>
+        {
+            let harness = harness.clone();
+            tokio::task::spawn_blocking(move || cli_replaced_recently(harness.as_ref()))
+                .await
+                .unwrap_or(false)
+        }
+        _ => false,
+    };
     let mut stream = match started {
         Ok(stream) => {
             resume_state
@@ -3387,7 +3419,7 @@ async fn drive_run(
         Err(err)
             if !resume_state.idle
                 && usize::from(resume_state.spawn_attempt) < SPAWN_RETRY_DELAYS.len()
-                && transient_start_failure(&err) =>
+                && transient_start_failure(&err, cli_just_replaced) =>
         {
             let delay = SPAWN_RETRY_DELAYS[usize::from(resume_state.spawn_attempt)];
             tracing::warn!(
@@ -5527,32 +5559,40 @@ mod tests {
         use std::io::{Error, ErrorKind};
         use zeron_harness::HarnessError;
         for kind in [
-            ErrorKind::PermissionDenied,
             ErrorKind::ResourceBusy,
             ErrorKind::ExecutableFileBusy,
             ErrorKind::WouldBlock,
             ErrorKind::Interrupted,
         ] {
             assert!(
-                transient_start_failure(&HarnessError::Io(Error::from(kind))),
+                transient_start_failure(&HarnessError::Io(Error::from(kind)), false),
                 "{kind:?}"
             );
         }
-        assert!(!transient_start_failure(&HarnessError::Io(Error::from(
-            ErrorKind::BrokenPipe
-        ))));
-        assert!(!transient_start_failure(&HarnessError::NotInstalled(
-            "claude".into()
-        )));
-        assert!(!transient_start_failure(&HarnessError::NotSignedIn(
-            "sign in".into()
-        )));
-        assert!(!transient_start_failure(&HarnessError::Protocol(
-            "bad frame".into()
-        )));
+        // A refused permission only right after the CLI was rewritten: a
+        // CLI that lost its execute bit never starts, however often retried.
+        let denied = HarnessError::Io(Error::from(ErrorKind::PermissionDenied));
+        assert!(transient_start_failure(&denied, true));
+        assert!(!transient_start_failure(&denied, false));
+        assert!(!transient_start_failure(
+            &HarnessError::Io(Error::from(ErrorKind::BrokenPipe)),
+            true
+        ));
+        assert!(!transient_start_failure(
+            &HarnessError::NotInstalled("claude".into()),
+            true
+        ));
+        assert!(!transient_start_failure(
+            &HarnessError::NotSignedIn("sign in".into()),
+            true
+        ));
+        assert!(!transient_start_failure(
+            &HarnessError::Protocol("bad frame".into()),
+            true
+        ));
         // A sharing violation (antivirus scanning a just-updated CLI).
         assert_eq!(
-            transient_start_failure(&HarnessError::Io(Error::from_raw_os_error(32))),
+            transient_start_failure(&HarnessError::Io(Error::from_raw_os_error(32)), false),
             cfg!(windows)
         );
     }
