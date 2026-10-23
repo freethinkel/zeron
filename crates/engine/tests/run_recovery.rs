@@ -445,6 +445,35 @@ async fn a_crashed_native_command_is_not_revived() {
 }
 
 #[tokio::test]
+async fn a_crashed_turn_that_starts_with_a_path_is_revived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let prompt = "/tmp/app/main.rs panics on start";
+    manufacture_crash(
+        &dir,
+        prompt,
+        Some("looking…"),
+        &[
+            session_started("hs-crash"),
+            AgentEvent::TextDelta {
+                text: "looking…".into(),
+            },
+        ],
+    );
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-after"));
+    wait_for(
+        || !requests.lock().unwrap().is_empty(),
+        "the revived turn to reach the provider",
+    )
+    .await;
+    let revived = requests.lock().unwrap()[0].clone();
+    assert!(revived.prompt.contains("Continue where you left off"));
+    assert!(revived.prompt.contains(prompt));
+    core.shutdown().await;
+}
+
+#[tokio::test]
 async fn a_crash_while_waiting_for_an_answer_is_not_revived() {
     let tmp = tempfile::tempdir().unwrap();
     let dir = data_dir(&tmp);

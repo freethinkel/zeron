@@ -2610,16 +2610,40 @@ impl Inner {
     }
 }
 
-/// Whether the provider routes this prompt as a native command: its delivered
-/// text leads with `/name` (Codex `command_request`, OpenCode commands, Claude
-/// slash commands). Anything put in front of it would make it model input.
+/// Whether the provider routes this prompt as a native command: a command
+/// selected in the composer leads it, or its delivered text leads with a
+/// `/name` in the command grammar (Codex `command_request`, OpenCode
+/// commands, Claude slash commands). Anything put in front of it would make
+/// it model input. A leading path ("/tmp/app/main.rs panics…") is not a
+/// command name: it is ordinary work.
 fn native_command(prompt: &str, harness: HarnessId) -> bool {
+    use zeron_proto::invocation::{self, Invocation};
+    let selected = invocation::invocation_links(prompt)
+        .into_iter()
+        .next()
+        .is_some_and(|(range, selection)| {
+            prompt[..range.start]
+                .trim_matches([' ', '\t', '\r', '\n'])
+                .is_empty()
+                && match selection {
+                    Invocation::Command { .. } => true,
+                    Invocation::Skill {
+                        command: Some(command),
+                        ..
+                    } => command.harness == harness,
+                    Invocation::Skill { .. } => false,
+                }
+        });
+    if selected {
+        return true;
+    }
     let delivered = if harness == HarnessId::Codex {
-        zeron_proto::invocation::invocation_prompt(prompt)
+        invocation::invocation_prompt(prompt)
     } else {
-        zeron_proto::invocation::harness_prompt(prompt, harness)
+        invocation::harness_prompt(prompt, harness)
     };
-    zeron_proto::invocation::leading_command(&delivered).is_some()
+    invocation::leading_command(&delivered)
+        .is_some_and(|(name, _)| invocation::valid_skill_command_name(name))
 }
 
 /// What boot recovery does with a turn the engine cut off.
@@ -5544,6 +5568,33 @@ mod tests {
             "failed to create session: node executable not found"
         ));
         assert!(!resume_rejected("exited unexpectedly (exit code 1): boom"));
+    }
+
+    #[test]
+    fn a_leading_path_is_not_a_native_command() {
+        for harness in [HarnessId::ClaudeCode, HarnessId::Codex, HarnessId::Opencode] {
+            assert!(native_command("/compact", harness), "{harness:?}");
+            assert!(
+                native_command("  /review the tests", harness),
+                "{harness:?}"
+            );
+            assert!(
+                !native_command("/tmp/app/main.rs panics on start", harness),
+                "{harness:?}"
+            );
+            assert!(
+                !native_command("fix /tmp/app/main.rs", harness),
+                "{harness:?}"
+            );
+        }
+        let selected = zeron_proto::invocation::Invocation::Command {
+            name: "review".into(),
+        }
+        .link();
+        assert!(native_command(
+            &format!("{selected} the parser"),
+            HarnessId::ClaudeCode
+        ));
     }
 
     #[test]
