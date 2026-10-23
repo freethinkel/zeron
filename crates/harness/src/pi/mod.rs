@@ -22,6 +22,14 @@ use std::{
 use tokio::sync::mpsc;
 use zeron_proto::{AgentEvent, HarnessId, Model, ReasoningLevel, RunRequest, SteeringMode};
 
+/// Bound on a state query (`get_state`, `get_entries`) a turn's end waits on.
+/// Pi answers them at once even mid-run; silence past this is a wedged
+/// process, which fails the run instead of leaving it Working forever.
+const STATE_QUERY_TIMEOUT: Duration = Duration::from_secs(15);
+/// Bound on applying a mid-session model or thinking change (several
+/// queries, one of which lists the available models).
+const CONFIGURE_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub struct PiHarness {
     models_cache: crate::catalog::Catalog,
     workspace_commands: crate::skills::CommandDiscovery,
@@ -223,7 +231,7 @@ impl Process {
         }
     }
     async fn shutdown(&mut self, grace: Duration) {
-        self.dialogs.cancel();
+        self.dialogs.cancel(&self.transport.client);
         self.child.shutdown(grace).await;
     }
 }
@@ -391,6 +399,8 @@ impl Harness for PiHarness {
                 session: String::new(),
                 assistant: uuid::Uuid::new_v4().to_string(),
                 lost_context,
+                recheck_state: false,
+                state_deadline: None,
             };
             // The lease lives through shutdown even if the consumer drops its stream.
             let RunControls {
@@ -409,7 +419,17 @@ impl Harness for PiHarness {
                 _=consumer.closed()=>Ok(()),
             };
             if let Err(error) = result {
-                let status = runner.process.child.try_wait().ok().flatten();
+                // The first symptom of a crash is usually the pipe's ("Pi
+                // stdout closed", EPIPE), racing the exit itself: give the exit
+                // and the stderr tail a moment so the message names the crash.
+                let status =
+                    tokio::time::timeout(Duration::from_millis(250), runner.process.child.wait())
+                        .await
+                        .ok()
+                        .and_then(Result::ok);
+                if status.is_some() {
+                    runner.process.tail.wait_closed().await;
+                }
                 runner.norm.error = Some(if status.is_some() {
                     crate::crash_message("Pi", status, &runner.process.tail)
                 } else {
@@ -437,6 +457,8 @@ struct Delivery {
     epoch: u64,
     // Queue acceptance permits sending the next steer, but is not consumption.
     queued: bool,
+    // Sent while no turn ran: it starts its own turn rather than joining one.
+    opens_turn: bool,
 }
 struct Runner {
     extension_commands: HashSet<String>,
@@ -457,6 +479,12 @@ struct Runner {
     session: String,
     assistant: String,
     lost_context: Option<String>,
+    /// The last state barrier found Pi busy (streaming, compacting, queued
+    /// input) with no settle event guaranteed to follow: re-check at the end
+    /// of compaction or of an automatic retry.
+    recheck_state: bool,
+    /// When an outstanding state query gives up (see STATE_QUERY_TIMEOUT).
+    state_deadline: Option<tokio::time::Instant>,
 }
 impl Runner {
     async fn emit(&self, event: AgentEvent) -> Result<(), HarnessError> {
@@ -481,7 +509,7 @@ impl Runner {
             return Ok(());
         }
         self.active = false;
-        self.process.dialogs.cancel();
+        self.process.dialogs.cancel(&self.process.transport.client);
         self.emit(AgentEvent::Done {
             status: if self.interrupted {
                 zeron_proto::DoneStatus::Interrupted
@@ -702,7 +730,17 @@ impl Runner {
                         // live process before the message it was sent with.
                         if let Some(next) = &steer.config {
                             let mut backlog = vec![];
-                            self.configure(next, &mut backlog).await?;
+                            tokio::time::timeout(
+                                CONFIGURE_TIMEOUT,
+                                self.configure(next, &mut backlog),
+                            )
+                            .await
+                            .map_err(|_| {
+                                HarnessError::Protocol(format!(
+                                    "Pi did not apply the model change within {}s",
+                                    CONFIGURE_TIMEOUT.as_secs()
+                                ))
+                            })??;
                             self.request.model = next.model.clone();
                             self.request.reasoning = next.reasoning;
                             self.request.model_options = next.model_options.clone();
@@ -710,7 +748,8 @@ impl Runner {
                                 self.frame(frame).await?;
                             }
                         }
-                        if !self.active {
+                        let opens_turn = !self.active;
+                        if opens_turn {
                             self.norm.reset();
                         }
                         self.epoch += 1;
@@ -722,6 +761,7 @@ impl Runner {
                         self.deliveries.push_back(Delivery {
                             epoch: self.epoch,
                             queued: false,
+                            opens_turn,
                         });
                     }
                 }
@@ -729,9 +769,26 @@ impl Runner {
             if !self.active && !open && self.queued.is_empty() {
                 return Ok(());
             }
+            if !self.pending.values().any(|p| {
+                matches!(
+                    p,
+                    Pending::Barrier(_) | Pending::EmptyEntries(..) | Pending::EmptyState(..)
+                )
+            }) {
+                self.state_deadline = None;
+            }
+            let state_deadline = self.state_deadline;
             tokio::select! {
                 incoming=self.process.next()=>self.frame(incoming?).await?,
-                steer=steering.recv(),if open=>match steer {Some(steer)=>self.queued.push_back(steer),None=>open=false}
+                steer=steering.recv(),if open=>match steer {Some(steer)=>self.queued.push_back(steer),None=>open=false},
+                _ = tokio::time::sleep_until(state_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                    if state_deadline.is_some() =>
+                {
+                    return Err(HarnessError::Protocol(format!(
+                        "Pi did not answer a state query within {}s",
+                        STATE_QUERY_TIMEOUT.as_secs()
+                    )));
+                }
             }
         }
     }
@@ -748,7 +805,7 @@ impl Runner {
     }
     async fn interrupt(&mut self, grace: Duration) {
         self.interrupted = true;
-        self.process.dialogs.cancel();
+        self.process.dialogs.cancel(&self.process.transport.client);
         self.queued.clear();
         self.deliveries.clear();
         if !self.active {
@@ -779,6 +836,40 @@ impl Runner {
         })
         .await;
     }
+    /// Send a state query the turn's end depends on, under STATE_QUERY_TIMEOUT.
+    fn query_state(&mut self, command: Value, pending: Pending) -> Result<(), HarnessError> {
+        let id = self.process.transport.client.request(command)?;
+        self.pending.insert(id, pending);
+        self.state_deadline = Some(tokio::time::Instant::now() + STATE_QUERY_TIMEOUT);
+        Ok(())
+    }
+    /// Pi refused a submission: a steer it would not take, a failed command.
+    /// That fails the input, not the run. A turn the input joined goes on; a
+    /// turn it opened settles Errored through the usual state barrier.
+    async fn rejected(&mut self, epoch: u64, error: HarnessError) -> Result<(), HarnessError> {
+        let message = error.to_string();
+        let opened = match self.deliveries.iter().position(|d| d.epoch == epoch) {
+            Some(0) if self.deliveries[0].opens_turn => {
+                // Its own segment, as if consumed, so the error lands there.
+                self.confirm_delivery().await?;
+                true
+            }
+            Some(index) => {
+                // It will never see a consumption event.
+                self.deliveries.remove(index);
+                false
+            }
+            None => std::mem::take(&mut self.initial_pending),
+        };
+        if opened {
+            self.norm.error = Some(message.clone());
+        }
+        self.emit(AgentEvent::Error { message }).await?;
+        if epoch == self.epoch && self.active {
+            self.query_state(json!({"type":"get_state"}), Pending::Barrier(epoch))?;
+        }
+        Ok(())
+    }
     async fn state(&mut self, data: Value, empty_proof: Option<bool>) -> Result<(), HarnessError> {
         let session = data["sessionId"]
             .as_str()
@@ -798,20 +889,28 @@ impl Runner {
             .as_bool()
             .unwrap_or(self.auto_compaction);
         self.norm.window = data["model"]["contextWindow"].as_u64().or(self.norm.window);
-        if data["isStreaming"] != false
-            || data["isCompacting"] != false
-            || self.pending.values().any(|p| {
-                matches!(
-                    p,
-                    Pending::Prompt(_)
-                        | Pending::Command(_)
-                        | Pending::EmptyEntries(..)
-                        | Pending::EmptyState(..)
-                )
-            })
-        {
+        if self.pending.values().any(|p| {
+            matches!(
+                p,
+                Pending::Prompt(_)
+                    | Pending::Command(_)
+                    | Pending::EmptyEntries(..)
+                    | Pending::EmptyState(..)
+            )
+        }) {
             return Ok(());
         }
+        // Busy: the next agent_settled normally re-checks. Compaction and
+        // automatic retries can end without one, so remember to re-check
+        // when they end (see `frame`). Queued input means work is coming.
+        if data["isStreaming"] != false
+            || data["isCompacting"] != false
+            || data["pendingMessageCount"].as_u64().is_some_and(|n| n > 0)
+        {
+            self.recheck_state = true;
+            return Ok(());
+        }
+        self.recheck_state = false;
         if file.is_some_and(|p| {
             p.metadata()
                 .is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound)
@@ -824,13 +923,8 @@ impl Runner {
                         .remember_empty(&data, Path::new(&self.request.cwd))?;
                 }
             } else {
-                let id = self
-                    .process
-                    .transport
-                    .client
-                    .request(json!({"type":"get_entries"}))?;
-                self.pending
-                    .insert(id, Pending::EmptyEntries(self.epoch, self.session.clone()));
+                let pending = Pending::EmptyEntries(self.epoch, self.session.clone());
+                self.query_state(json!({"type":"get_entries"}), pending)?;
                 return Ok(());
             }
         }
@@ -895,7 +989,13 @@ impl Runner {
             let Some(pending) = self.pending.remove(string(&frame, "id")) else {
                 return Ok(());
             };
-            let data = response_data(frame)?;
+            let data = match (response_data(frame), &pending) {
+                (Ok(data), _) => data,
+                (Err(error), Pending::Prompt(epoch) | Pending::Command(epoch)) => {
+                    return self.rejected(*epoch, error).await;
+                }
+                (Err(error), _) => return Err(error),
+            };
             if let Pending::Command(epoch) = pending {
                 if epoch == self.epoch {
                     self.initial_pending = false;
@@ -906,23 +1006,13 @@ impl Runner {
                         serde_json::to_string_pretty(&data).unwrap()
                     };
                     self.emit(AgentEvent::TextDelta { text }).await?;
-                    let id = self
-                        .process
-                        .transport
-                        .client
-                        .request(json!({"type":"get_state"}))?;
-                    self.pending.insert(id, Pending::Barrier(epoch));
+                    self.query_state(json!({"type":"get_state"}), Pending::Barrier(epoch))?;
                 }
                 return Ok(());
             }
             match pending {
                 Pending::Prompt(epoch) if epoch == self.epoch && self.active => {
-                    let id = self
-                        .process
-                        .transport
-                        .client
-                        .request(json!({"type":"get_state"}))?;
-                    self.pending.insert(id, Pending::Barrier(epoch));
+                    self.query_state(json!({"type":"get_state"}), Pending::Barrier(epoch))?;
                 }
                 Pending::Barrier(epoch) if epoch == self.epoch && self.active => {
                     self.state(data, None).await?;
@@ -936,13 +1026,10 @@ impl Runner {
                             )
                         })
                     });
-                    let id = self
-                        .process
-                        .transport
-                        .client
-                        .request(json!({"type":"get_state"}))?;
-                    self.pending
-                        .insert(id, Pending::EmptyState(epoch, session, clean));
+                    self.query_state(
+                        json!({"type":"get_state"}),
+                        Pending::EmptyState(epoch, session, clean),
+                    )?;
                 }
                 Pending::EmptyState(epoch, session, clean)
                     if epoch == self.epoch && self.active =>
@@ -981,12 +1068,12 @@ impl Runner {
             self.emit(event).await?;
         }
         if frame["type"] == "agent_settled" {
-            let id = self
-                .process
-                .transport
-                .client
-                .request(json!({"type":"get_state"}))?;
-            self.pending.insert(id, Pending::Barrier(self.epoch));
+            self.query_state(json!({"type":"get_state"}), Pending::Barrier(self.epoch))?;
+        } else if matches!(string(&frame, "type"), "compaction_end" | "auto_retry_end")
+            && self.active
+            && std::mem::take(&mut self.recheck_state)
+        {
+            self.query_state(json!({"type":"get_state"}), Pending::Barrier(self.epoch))?;
         }
         Ok(())
     }
@@ -994,7 +1081,8 @@ impl Runner {
 /// Inline attachments as native image blocks, best-effort like the Claude
 /// driver: the path refs already ride the prompt text, so an unreadable,
 /// oversized or non-inlinable file (SVG, HEIC, TIFF, ...) must not fail the turn.
-async fn load_images(paths: &[String]) -> Value {
+/// The blocks are ACP's image content shape, so the ACP driver shares them.
+pub(crate) async fn load_images(paths: &[String]) -> Value {
     use base64::Engine;
     let mut images = vec![];
     for path in paths {

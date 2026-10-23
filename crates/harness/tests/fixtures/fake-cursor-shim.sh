@@ -125,6 +125,30 @@ case "$first" in
   exit 0
   ;;
 
+*scenario:stop-wedge*)
+  # The SDK's cancel wedges: a stop is never answered.
+  emit '{"ev":"ready","agentId":"agent-stop","model":"auto"}'
+  emit '{"ev":"text","text":"working"}'
+  read -r msg || exit 0
+  exec sleep 30
+  ;;
+
+*scenario:images*)
+  case "$first" in
+    *'"images":[{"data":"'*'"mimeType":"image/png","type":"image"}]'*) ;;
+    *) emit '{"ev":"fatal","message":"images missing"}'; exit 1 ;;
+  esac
+  emit '{"ev":"ready","agentId":"agent-img","model":"auto"}'
+  emit '{"ev":"turn","status":"finished"}'
+  read -r next || exit 0
+  case "$next" in
+    *'"images":[{"data":"'*) emit '{"ev":"steered"}'; emit '{"ev":"text","text":"steer image"}' ;;
+    *) emit '{"ev":"steered"}'; emit '{"ev":"text","text":"steer image missing"}' ;;
+  esac
+  emit '{"ev":"turn","status":"finished"}'
+  read -r next || exit 0
+  ;;
+
 *scenario:interrupt-fatal*)
   emit '{"ev":"ready","agentId":"agent-int-fatal","model":"auto"}'
   emit '{"ev":"text","text":"working"}'

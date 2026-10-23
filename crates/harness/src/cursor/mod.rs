@@ -60,6 +60,11 @@ use crate::{Harness, HarnessError, RunControls, Signal, send_signal, shutdown_ch
 const CURSOR_SDK_PIN: &str = "@cursor/sdk@1.0.32";
 const SHIM_NAME: &str = "zeron-cursor-shim.mjs";
 const SHIM_SOURCE: &str = include_str!("shim.mjs");
+/// A stopped turn normally settles `cancelled` at once. The SDK's cancel can
+/// wedge on a dead transport, leaving the run unsettled: past this the turn
+/// closes as stopped and the shim is retired; the next message resumes the
+/// agent in a fresh one.
+const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(12);
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -93,6 +98,7 @@ pub struct CursorHarness {
     executable: Option<PathBuf>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    stop_timeout: Duration,
     /// Credential-scoped successful catalog, with bounded refresh and backoff.
     pub(crate) models_cache: catalog::Catalog,
     /// Models whose catalog default is a Max Mode variant, from the latest
@@ -108,6 +114,7 @@ impl Default for CursorHarness {
             executable: None,
             interrupt_grace: Duration::from_secs(2),
             kill_grace: Duration::from_secs(3),
+            stop_timeout: DEFAULT_STOP_TIMEOUT,
             models_cache: catalog::Catalog::default(),
             max_mode_defaults: Default::default(),
         }
@@ -136,6 +143,13 @@ impl CursorHarness {
     pub fn with_graces(mut self, interrupt_grace: Duration, kill_grace: Duration) -> Self {
         self.interrupt_grace = interrupt_grace;
         self.kill_grace = kill_grace;
+        self
+    }
+
+    /// Tune the turn-stop bound (tests shrink it; default 12s).
+    #[doc(hidden)]
+    pub fn with_stop_timeout(mut self, timeout: Duration) -> Self {
+        self.stop_timeout = timeout;
         self
     }
 
@@ -268,12 +282,17 @@ impl Harness for CursorHarness {
     fn reasoning_levels(&self) -> &[ReasoningLevel] {
         &[]
     }
-    /// "Installed" means the user's own cursor-agent CLI is present — the
-    /// user-visible signal they use Cursor (the SDK itself is a managed
-    /// install zeron performs on demand).
+    /// "Installed" means the user evidently uses Cursor: their own
+    /// cursor-agent CLI, or credentials the SDK itself runs on —
+    /// `CURSOR_API_KEY`, or its saved login (which Zeron's own Cursor sign-in
+    /// writes). The SDK never uses the CLI, so requiring it hid Cursor from
+    /// users who signed in without installing it (common on Windows). The SDK
+    /// itself is a managed install zeron performs on demand.
     fn installed(&self) -> bool {
         self.executable.is_some()
             || crate::acp::find_on_paths("cursor-agent", cursor_cli_paths()).is_some()
+            || std::env::var_os("CURSOR_API_KEY").is_some_and(|key| !key.is_empty())
+            || catalog::sdk_auth_file().is_file()
     }
     fn executable_path(&self) -> Option<PathBuf> {
         self.executable
@@ -400,6 +419,8 @@ impl Harness for CursorHarness {
 
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(stdin_writer(stdin, stdin_rx));
+        // The SDK takes images with the text; the path refs ride the text too.
+        let images = crate::pi::load_images(&request.attachments).await;
         let first = json!({
             "op": "run",
             "prompt": request.prompt,
@@ -411,6 +432,7 @@ impl Harness for CursorHarness {
             "resume": request.resume,
             "mcp": request.mcp,
             "storeDir": lease.as_ref().and_then(|lease| lease.store_dir.as_ref()),
+            "images": images,
         });
         let _ = stdin_tx.send(first.to_string());
 
@@ -427,6 +449,7 @@ impl Harness for CursorHarness {
             catalog,
             interrupt_grace: self.interrupt_grace,
             kill_grace: self.kill_grace,
+            stop_timeout: self.stop_timeout,
             stderr_tail,
         }));
 
@@ -595,6 +618,7 @@ struct Session {
     catalog: Vec<Model>,
     interrupt_grace: Duration,
     kill_grace: Duration,
+    stop_timeout: Duration,
     stderr_tail: crate::StderrTail,
 }
 
@@ -615,6 +639,7 @@ async fn run_session(session: Session) {
         catalog,
         interrupt_grace,
         kill_grace,
+        stop_timeout,
         stderr_tail,
     } = session;
     let RunControls {
@@ -634,6 +659,8 @@ async fn run_session(session: Session) {
     // A turn stop (`TurnControl::stop_turn`) in flight: the shim cancels the
     // run; the agent stays up for the next prompt.
     let mut stopping = false;
+    // When a stop in flight gives up on the shim (see DEFAULT_STOP_TIMEOUT).
+    let mut stop_deadline: Option<tokio::time::Instant> = None;
     let mut any_done = false;
     let mut done_after_interrupt = false;
     // A turn is settled and the session is parked awaiting the next prompt.
@@ -677,9 +704,30 @@ async fn run_session(session: Session) {
                     }).await { break 'main; }
                 } else {
                     stopping = true;
+                    stop_deadline = Some(tokio::time::Instant::now() + stop_timeout);
                     pending_steers = 0;
                     let _ = stdin_tx.send(json!({ "op": "stop" }).to_string());
                 }
+            },
+
+            // The stop went unanswered: the SDK's cancel wedged. Close the
+            // turn as stopped and retire the shim; the next message resumes
+            // the agent in a fresh one.
+            _ = tokio::time::sleep_until(stop_deadline.unwrap_or_else(tokio::time::Instant::now)),
+                if stop_deadline.is_some() && stopping && !interrupted =>
+            {
+                tracing::warn!(target: "zeron_harness::cursor",
+                    session_id = ?session_id,
+                    "a stopped turn did not settle within {}s; retiring the shim",
+                    stop_timeout.as_secs());
+                any_done = true;
+                let _ = send(AgentEvent::Done {
+                    status: DoneStatus::Interrupted,
+                    result: None,
+                    error: None,
+                    session_id: session_id.clone(),
+                }).await;
+                break 'main;
             },
 
             line = stdout_lines.next_line() => match line {
@@ -753,6 +801,7 @@ async fn run_session(session: Session) {
                                 if is_done {
                                     any_done = true;
                                     stopping = false;
+                                    stop_deadline = None;
                                     if interrupted {
                                         done_after_interrupt = true;
                                         break 'main;
@@ -780,6 +829,9 @@ async fn run_session(session: Session) {
                     parked = false;
                     any_done = false;
                     let mut line = json!({ "op": "steer", "prompt": msg.prompt });
+                    if !msg.attachments.is_empty() {
+                        line["images"] = crate::pi::load_images(&msg.attachments).await;
+                    }
                     // A changed model runs from this message's own turn.
                     if let Some(mut next) = msg.config {
                         fill_catalog_defaults(&catalog, next.model.as_deref(), &mut next.model_options);

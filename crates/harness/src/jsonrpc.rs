@@ -9,7 +9,9 @@
 //! - Notifications and server→client requests (approvals) are pumped into an
 //!   [`Incoming`] channel the session loop drains.
 //! - Writes to a dead child's stdin (EPIPE) are tolerated and logged, matching
-//!   the TS harness's swallowed-EPIPE behavior.
+//!   the TS harness's swallowed-EPIPE behavior — but they close the client:
+//!   every pending request fails at once instead of waiting for stdout EOF,
+//!   which a descendant holding the pipe open can delay indefinitely.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
@@ -73,10 +75,15 @@ impl RpcClient {
         observer: Option<StdoutObserver>,
     ) -> (Self, mpsc::Receiver<Incoming>) {
         let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
-        tokio::spawn(write_loop(stdin, writer_rx));
         let pending: Pending = Arc::default();
         let (incoming_tx, incoming_rx) = mpsc::channel(256);
         let closed = Arc::new(AtomicBool::new(false));
+        tokio::spawn(write_loop(
+            stdin,
+            writer_rx,
+            Arc::clone(&pending),
+            closed.clone(),
+        ));
         let voice_router = Arc::default();
         tokio::spawn(read_loop(
             stdout,
@@ -208,8 +215,15 @@ impl RpcClient {
 }
 
 /// Owns the child's stdin; a write failure (EPIPE after the child died) is
-/// tolerated and logged.
-async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {
+/// tolerated and logged. Nothing written after it can be answered, so the
+/// client closes and every pending request fails now: a caller must not wait
+/// on stdout EOF, which a surviving descendant can hold off forever.
+async fn write_loop(
+    mut stdin: ChildStdin,
+    mut rx: mpsc::UnboundedReceiver<String>,
+    pending: Pending,
+    closed: Arc<AtomicBool>,
+) {
     while let Some(line) = rx.recv().await {
         let write = async {
             stdin.write_all(line.as_bytes()).await?;
@@ -218,8 +232,20 @@ async fn write_loop(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<Strin
         };
         if let Err(e) = write.await {
             tracing::debug!(target: "zeron_harness::rpc", "stdin write failed (tolerated): {e}");
+            fail_pending(&pending, &closed, &format!("app-server stdin closed ({e})"));
             return;
         }
+    }
+}
+
+/// Close the client and reject every awaiting request with `reason`. Done
+/// under the pending lock so a request racing it is either rejected by
+/// [`RpcClient::request_now`]'s closed check or drained here.
+fn fail_pending(pending: &Pending, closed: &AtomicBool, reason: &str) {
+    let mut pending = pending.lock().expect("pending lock");
+    closed.store(true, Ordering::Release);
+    for (_, sender) in pending.drain() {
+        let _ = sender.send(Err(reason.to_owned()));
     }
 }
 
@@ -298,7 +324,15 @@ async fn read_loop(
         match (method, id) {
             // Response: resolve the awaiting request.
             (None, Some(id)) => {
-                if msg.get("result").is_none() && msg.get("error").is_none() {
+                // A bare `{jsonrpc, id}` is a JS server answering a void
+                // method (`JSON.stringify` drops an undefined `result`);
+                // skipping it would strand the caller, so it resolves as a
+                // null result. A frame carrying anything else but neither
+                // `result` nor `error` is diagnostic noise, not a response.
+                let bare = msg
+                    .as_object()
+                    .is_some_and(|frame| frame.keys().all(|k| k == "jsonrpc" || k == "id"));
+                if msg.get("result").is_none() && msg.get("error").is_none() && !bare {
                     continue;
                 }
                 let Some(id) = response_id(id) else { continue };
@@ -436,6 +470,55 @@ mod tests {
         assert!(result.unwrap_err().to_string().contains("exited"));
         assert!(client.pending.lock().unwrap().is_empty());
         assert!(receiver.try_recv().is_err());
+    }
+
+    /// A child speaking `script` over piped stdio, plus its client.
+    #[cfg(unix)]
+    fn scripted_child(
+        script: &str,
+    ) -> (tokio::process::Child, RpcClient, mpsc::Receiver<Incoming>) {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let (client, incoming) =
+            RpcClient::new(child.stdin.take().unwrap(), child.stdout.take().unwrap());
+        (child, client, incoming)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn void_response_resolves_its_caller_with_null() {
+        let (_child, client, _incoming) =
+            scripted_child(r#"read line; echo '{"jsonrpc":"2.0","id":1}'; sleep 5"#);
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.request("session/set_mode", json!({})),
+        )
+        .await
+        .expect("a void response must not strand its caller");
+        assert_eq!(result.unwrap(), Value::Null);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_write_fails_pending_requests_while_stdout_stays_open() {
+        // The child closes stdin but keeps stdout open, like a crashed adapter
+        // whose descendant still holds the pipe.
+        let (_child, client, _incoming) = scripted_child("exec 0<&-; sleep 5");
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.request("session/prompt", json!({})),
+        )
+        .await
+        .expect("a failed write must fail the request without waiting for EOF");
+        assert!(result.unwrap_err().to_string().contains("stdin closed"));
+        assert!(client.is_closed());
+        assert!(client.pending.lock().unwrap().is_empty());
     }
 
     #[test]
