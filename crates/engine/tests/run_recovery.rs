@@ -1,0 +1,734 @@
+//! Engine-side run recovery that applies to every provider:
+//! - boot recovery revives a turn the engine cut off with a continuation when
+//!   the provider already worked on it, and leaves alone what it must not
+//!   revive (native commands, open questions, an exhausted revival budget);
+//! - a graceful shutdown marks the turns it cuts off and the next boot picks
+//!   them back up, while a user's Stop is never undone;
+//! - a transient start failure retries with backoff, a deterministic one
+//!   surfaces at once;
+//! - a resume id the provider says is gone is retried once in a fresh
+//!   session, which then replaces the stored id.
+
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use async_trait::async_trait;
+use futures::StreamExt;
+use futures::stream::BoxStream;
+
+use zeron_doc::{
+    MessagePart, MessageRole, MessageStatus, SessionCommandPayload, SessionDoc, SessionMessageEntry,
+};
+use zeron_engine::{EngineCore, HarnessRegistry, RunJournal};
+use zeron_harness::{Harness, HarnessError, RunControls};
+use zeron_proto::{
+    AgentEvent, DoneStatus, HarnessId, Model, ReasoningLevel, RunRequest, SandboxLevel,
+    SessionStatus, SteeringMode,
+};
+use zeron_sync::DocsStore;
+
+const CHAT: &str = "chat-recovery";
+const DEVICE: &str = "dev-recovery";
+
+type RequestLog = Arc<Mutex<Vec<RunRequest>>>;
+/// What a scripted run does, given its request and its 0-based call index.
+type Script =
+    Arc<dyn Fn(&RunRequest, usize) -> Result<Vec<AgentEvent>, HarnessError> + Send + Sync>;
+
+fn run_request(prompt: &str) -> RunRequest {
+    RunRequest {
+        mcp: None,
+        prompt: prompt.into(),
+        harness: None,
+        model: None,
+        reasoning: None,
+        model_options: Default::default(),
+        cwd: "/tmp".into(),
+        sandbox: SandboxLevel::WorkspaceWrite,
+        auto_approve: true,
+        attachments: Vec::new(),
+        worktree: None,
+        resume: None,
+        env: Default::default(),
+    }
+}
+
+fn session_started(session_id: &str) -> AgentEvent {
+    AgentEvent::SessionStarted {
+        harness: HarnessId::Mock,
+        model: "mock-1".into(),
+        tools: vec![],
+        cwd: "/tmp".into(),
+        session_id: session_id.into(),
+        assistant_message_id: "a-1".into(),
+    }
+}
+
+/// A full successful turn in session `session_id`.
+fn completed_turn(session_id: &str, text: &str) -> Vec<AgentEvent> {
+    vec![
+        session_started(session_id),
+        AgentEvent::TextDelta { text: text.into() },
+        AgentEvent::Done {
+            status: DoneStatus::Completed,
+            result: None,
+            error: None,
+            session_id: Some(session_id.into()),
+        },
+    ]
+}
+
+/// Records every request and answers it from a script.
+struct ScriptedHarness {
+    requests: RequestLog,
+    script: Script,
+}
+
+impl ScriptedHarness {
+    /// Every run completes in session `session_id`.
+    fn completing(requests: &RequestLog, session_id: &'static str) -> Self {
+        Self {
+            requests: requests.clone(),
+            script: Arc::new(move |request, _| {
+                Ok(completed_turn(
+                    session_id,
+                    &format!("ack: {}", request.prompt),
+                ))
+            }),
+        }
+    }
+}
+
+#[async_trait]
+impl Harness for ScriptedHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Scripted"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        _controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let call = {
+            let mut log = self.requests.lock().unwrap();
+            log.push(request.clone());
+            log.len() - 1
+        };
+        let events = (self.script)(&request, call)?;
+        Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+    }
+}
+
+/// Streams a little output in session `hs-held`, then holds the turn open
+/// (or parks it on a question) until the engine interrupts it.
+struct HoldingHarness {
+    ask: bool,
+}
+
+#[async_trait]
+impl Harness for HoldingHarness {
+    fn id(&self) -> HarnessId {
+        HarnessId::Mock
+    }
+    fn display_name(&self) -> &str {
+        "Holding"
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        _request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let ask = self.ask;
+        tokio::spawn(async move {
+            let _ = tx.send(Ok(session_started("hs-held")));
+            let _ = tx.send(Ok(AgentEvent::TextDelta {
+                text: "working on it…".into(),
+            }));
+            let _answer = ask.then(|| (controls.request_input)(Vec::new()));
+            controls.interrupt.cancelled().await;
+            drop(tx); // the stream ends: the engine reads it as interrupted
+        });
+        Ok(futures::stream::unfold(
+            rx,
+            |mut rx| async move { rx.recv().await.map(|ev| (ev, rx)) },
+        )
+        .boxed())
+    }
+}
+
+fn assemble(dir: &std::path::Path, harness: impl Harness + 'static) -> EngineCore {
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(harness));
+    EngineCore::assemble(dir, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles")
+}
+
+fn data_dir(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+    let dir = tmp.path().join("data");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Pinned so manufactured entries count as this device's own.
+    std::fs::write(dir.join("device-id"), DEVICE).unwrap();
+    dir
+}
+
+fn journal(dir: &std::path::Path) -> RunJournal {
+    RunJournal::open(dir.join("orgs/dev-org/dev-user/journals")).unwrap()
+}
+
+/// Create + name the chat row so the auto-titler stays out of the request log.
+fn pre_title(core: &EngineCore) {
+    core.workspace
+        .create_space("space-recovery", &core.device_id, "/tmp", None, false)
+        .expect("create space row");
+    core.workspace
+        .create_chat(CHAT, Some("space-recovery"), None, None, None)
+        .expect("create chat row");
+    core.workspace
+        .rename_chat(CHAT, "Pre-titled")
+        .expect("rename chat");
+}
+
+fn queue_run(core: &EngineCore, prompt: &str, message_id: &str) {
+    core.doc_host
+        .queue_command(
+            CHAT,
+            SessionCommandPayload::Run {
+                request: run_request(prompt),
+                message_id: message_id.into(),
+            },
+        )
+        .expect("queue run command");
+}
+
+async fn wait_for<F: FnMut() -> bool>(mut predicate: F, what: &str) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    while !predicate() {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(15)).await;
+    }
+}
+
+fn entries_now(core: &EngineCore) -> Vec<SessionMessageEntry> {
+    core.doc_host
+        .open(CHAT)
+        .ok()
+        .and_then(|h| h.doc().read_entries().ok())
+        .unwrap_or_default()
+}
+
+fn complete_assistant_count(core: &EngineCore) -> usize {
+    entries_now(core)
+        .iter()
+        .filter(|e| e.role == MessageRole::Assistant && e.status == Some(MessageStatus::Complete))
+        .count()
+}
+
+fn error_notes(entry: &SessionMessageEntry) -> Vec<String> {
+    entry
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            MessagePart::Error { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
+
+/// The on-disk state a kill -9 mid-turn leaves: the user's message, its
+/// reply still `streaming` (when `partial` is given), and a journal that
+/// never reached `Done`.
+fn manufacture_crash(
+    dir: &std::path::Path,
+    prompt: &str,
+    partial: Option<&str>,
+    events: &[AgentEvent],
+) {
+    let now = now_ms();
+    let store = DocsStore::open(dir.join("orgs/dev-org/dev-user")).unwrap();
+    let doc = SessionDoc::init(CHAT).unwrap();
+    let entry = |id: &str, role, text: &str, created_at, status| SessionMessageEntry {
+        id: id.into(),
+        role,
+        parts: vec![MessagePart::Text {
+            id: "t0".into(),
+            text: text.into(),
+        }],
+        created_at,
+        device_id: DEVICE.into(),
+        status: Some(status),
+        continuation_of: None,
+        duration_ms: None,
+    };
+    doc.push_message(&entry(
+        "msg-user-1",
+        MessageRole::User,
+        prompt,
+        now - 60_000,
+        MessageStatus::Complete,
+    ))
+    .unwrap();
+    if let Some(partial) = partial {
+        doc.push_message(&entry(
+            "msg-assistant-1",
+            MessageRole::Assistant,
+            partial,
+            now - 30_000,
+            MessageStatus::Streaming,
+        ))
+        .unwrap();
+    }
+    store
+        .save_snapshot(CHAT, &doc.export_snapshot().unwrap())
+        .unwrap();
+    let journal = journal(dir);
+    for event in events {
+        journal.append(CHAT, event).unwrap();
+    }
+}
+
+fn aborted_entry(core: &EngineCore) -> SessionMessageEntry {
+    entries_now(core)
+        .into_iter()
+        .find(|e| e.status == Some(MessageStatus::Aborted))
+        .expect("the cut-off entry stays, stamped aborted")
+}
+
+/// Long enough for a revival that was (wrongly) armed to reach the harness.
+async fn settle() {
+    tokio::time::sleep(Duration::from_millis(400)).await;
+}
+
+#[tokio::test]
+async fn a_crash_before_any_output_resends_the_original_prompt() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    // Started, but nothing streamed: the provider never worked on it.
+    manufacture_crash(&dir, "long task", None, &[session_started("hs-crash")]);
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-after"));
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "the revived turn to complete",
+    )
+    .await;
+    let revived = requests.lock().unwrap()[0].clone();
+    assert_eq!(revived.prompt, "long task");
+    assert_eq!(revived.resume.as_deref(), Some("hs-crash"));
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_crashed_native_command_is_not_revived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    manufacture_crash(
+        &dir,
+        "/compact",
+        Some("compacting…"),
+        &[
+            session_started("hs-crash"),
+            AgentEvent::TextDelta {
+                text: "compacting…".into(),
+            },
+        ],
+    );
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-after"));
+    settle().await;
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "maintenance commands are never re-run on their own"
+    );
+    let notes = error_notes(&aborted_entry(&core));
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("engine restart") && !n.contains("resuming")),
+        "{notes:?}"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_crash_while_waiting_for_an_answer_is_not_revived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    manufacture_crash(
+        &dir,
+        "deploy it",
+        Some("Which environment?"),
+        &[
+            session_started("hs-crash"),
+            AgentEvent::TextDelta {
+                text: "Which environment?".into(),
+            },
+            AgentEvent::InputRequested {
+                request_id: "q-1".into(),
+                questions: vec![],
+            },
+        ],
+    );
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-after"));
+    settle().await;
+    assert!(requests.lock().unwrap().is_empty());
+    let notes = error_notes(&aborted_entry(&core));
+    assert!(
+        notes.iter().any(|n| n.contains("waited for your answer")),
+        "{notes:?}"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn revivals_stop_after_three_in_a_row_and_say_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    manufacture_crash(
+        &dir,
+        "long task",
+        Some("partial…"),
+        &[
+            session_started("hs-crash"),
+            AgentEvent::TextDelta {
+                text: "partial…".into(),
+            },
+        ],
+    );
+    // Three revivals in a row already died with the engine (a crash loop).
+    let ledger = journal(&dir);
+    for _ in 0..3 {
+        ledger.note_resume_attempt(CHAT, now_ms(), 0);
+    }
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-after"));
+    settle().await;
+    assert!(requests.lock().unwrap().is_empty(), "the loop must stop");
+    let notes = error_notes(&aborted_entry(&core));
+    assert!(
+        notes
+            .iter()
+            .any(|n| n.contains("not resumed automatically")),
+        "the cap says why the run did not resume: {notes:?}"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_message_the_user_sends_resets_the_revival_budget() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    journal(&dir).note_resume_attempt(CHAT, now_ms(), 0);
+    let requests: RequestLog = Default::default();
+    // The turn errors (no clean completion to reset the budget on its own).
+    let core = assemble(
+        &dir,
+        ScriptedHarness {
+            requests: requests.clone(),
+            script: Arc::new(|_, _| {
+                Ok(vec![
+                    session_started("hs-1"),
+                    AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some("model overloaded".into()),
+                        session_id: None,
+                    },
+                ])
+            }),
+        },
+    );
+    pre_title(&core);
+    queue_run(&core, "hello", "msg-user-1");
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Errored)
+        },
+        "the turn to end",
+    )
+    .await;
+    assert_eq!(journal(&dir).resume_attempts(CHAT, 0), 0);
+    core.shutdown().await;
+}
+
+/// Phase one of the shutdown tests: a turn streaming in a held run.
+async fn hold_a_turn(dir: &std::path::Path, ask: bool) -> EngineCore {
+    let core = assemble(dir, HoldingHarness { ask });
+    pre_title(&core);
+    queue_run(&core, "long task", "msg-user-1");
+    let want = if ask {
+        SessionStatus::AwaitingInput
+    } else {
+        SessionStatus::Working
+    };
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == want)
+                && entries_now(&core).iter().any(|e| {
+                    e.role == MessageRole::Assistant
+                        && e.parts.iter().any(
+                            |p| matches!(p, MessagePart::Text { text, .. } if !text.is_empty()),
+                        )
+                })
+        },
+        "the held turn to stream",
+    )
+    .await;
+    core
+}
+
+#[tokio::test]
+async fn a_graceful_shutdown_mid_turn_is_picked_back_up() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let core = hold_a_turn(&dir, false).await;
+    core.shutdown().await;
+    let notes = error_notes(&aborted_entry(&core));
+    assert!(
+        notes.iter().any(|n| n.contains("engine shutdown")),
+        "the cut-off entry says why it ended: {notes:?}"
+    );
+    drop(core);
+
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "the interrupted turn to be picked back up",
+    )
+    .await;
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 1, "{log:#?}");
+        assert!(
+            log[0].prompt.contains("Continue where you left off"),
+            "the session already holds the request: {:?}",
+            log[0].prompt
+        );
+        assert_eq!(log[0].resume.as_deref(), Some("hs-held"));
+    }
+    // Still one user message, in the user's own words.
+    let users: Vec<_> = entries_now(&core)
+        .into_iter()
+        .filter(|e| e.role == MessageRole::User)
+        .collect();
+    assert_eq!(users.len(), 1);
+    assert!(matches!(&users[0].parts[0], MessagePart::Text { text, .. } if text == "long task"));
+    core.shutdown().await;
+    drop(core);
+
+    // The mark is spent: a further restart revives nothing.
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+    settle().await;
+    assert_eq!(requests.lock().unwrap().len(), 1);
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_stopped_turn_is_not_revived_after_shutdown() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let core = hold_a_turn(&dir, false).await;
+    assert!(
+        core.sessions.interrupt(CHAT).await.unwrap(),
+        "the user's Stop"
+    );
+    core.shutdown().await;
+    drop(core);
+
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+    settle().await;
+    assert!(
+        requests.lock().unwrap().is_empty(),
+        "a Stop is never undone"
+    );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_shutdown_while_waiting_for_an_answer_is_not_revived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let core = hold_a_turn(&dir, true).await;
+    core.shutdown().await;
+    drop(core);
+
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+    settle().await;
+    assert!(requests.lock().unwrap().is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_shutdown_after_sign_out_is_not_revived() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let core = hold_a_turn(&dir, false).await;
+    core.sessions.forgo_revival();
+    core.shutdown().await;
+    drop(core);
+
+    let requests: RequestLog = Default::default();
+    let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-held"));
+    settle().await;
+    assert!(requests.lock().unwrap().is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_transient_start_failure_retries_with_backoff() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    // Antivirus holding a freshly updated CLI: two refused spawns.
+    let core = assemble(
+        &dir,
+        ScriptedHarness {
+            requests: requests.clone(),
+            script: Arc::new(|request, call| {
+                if call < 2 {
+                    Err(HarnessError::Io(std::io::Error::from(
+                        std::io::ErrorKind::PermissionDenied,
+                    )))
+                } else {
+                    Ok(completed_turn("hs-1", &format!("ack: {}", request.prompt)))
+                }
+            }),
+        },
+    );
+    pre_title(&core);
+    queue_run(&core, "hello", "msg-user-1");
+    wait_for(
+        || complete_assistant_count(&core) == 1,
+        "the retried turn to complete",
+    )
+    .await;
+    assert_eq!(requests.lock().unwrap().len(), 3, "two retries");
+    let entries = entries_now(&core);
+    assert_eq!(entries.len(), 2, "one user entry, one reply: {entries:#?}");
+    assert!(error_notes(&entries[1]).is_empty());
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_deterministic_start_failure_surfaces_at_once() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    let core = assemble(
+        &dir,
+        ScriptedHarness {
+            requests: requests.clone(),
+            script: Arc::new(|_, _| Err(HarnessError::NotInstalled("install mock".into()))),
+        },
+    );
+    pre_title(&core);
+    queue_run(&core, "hello", "msg-user-1");
+    wait_for(
+        || {
+            core.sessions
+                .session_status(CHAT)
+                .is_some_and(|s| s.status == SessionStatus::Errored)
+        },
+        "the start failure to surface",
+    )
+    .await;
+    settle().await;
+    assert_eq!(requests.lock().unwrap().len(), 1, "no retry");
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_resume_the_provider_rejects_retries_in_a_fresh_session() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let requests: RequestLog = Default::default();
+    {
+        let core = assemble(&dir, ScriptedHarness::completing(&requests, "hs-gone"));
+        pre_title(&core);
+        queue_run(&core, "first", "msg-user-1");
+        wait_for(|| complete_assistant_count(&core) == 1, "first turn").await;
+        core.shutdown().await;
+    }
+    // The provider has since lost that conversation (its store was wiped).
+    let core = assemble(
+        &dir,
+        ScriptedHarness {
+            requests: requests.clone(),
+            script: Arc::new(|request, _| {
+                Ok(match &request.resume {
+                    Some(id) => vec![AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some(format!(
+                            "Mock exited unexpectedly (exit code 1): No conversation found with session ID: {id}"
+                        )),
+                        session_id: None,
+                    }],
+                    None => completed_turn("hs-fresh", "fresh start"),
+                })
+            }),
+        },
+    );
+    queue_run(&core, "second", "msg-user-2");
+    wait_for(|| complete_assistant_count(&core) == 2, "second turn").await;
+    {
+        let log = requests.lock().unwrap();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert_eq!(log[1].resume.as_deref(), Some("hs-gone"));
+        assert_eq!(log[2].resume, None, "the retry starts a fresh session");
+        assert_eq!(log[2].prompt, "second");
+    }
+    // The fresh session replaces the dead id: the next turn resumes it.
+    queue_run(&core, "third", "msg-user-3");
+    wait_for(|| complete_assistant_count(&core) == 3, "third turn").await;
+    assert_eq!(
+        requests.lock().unwrap()[3].resume.as_deref(),
+        Some("hs-fresh")
+    );
+    core.shutdown().await;
+}
