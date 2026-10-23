@@ -2328,10 +2328,10 @@ async fn run_session(session: Session) {
 
     // The server is gone: it exited (`Some` status), or its bus could not be
     // revived. Settle everything still open — the turn as errored unless it
-    // was being interrupted — and end the run, so the next message starts a
-    // fresh server rather than failing against a dead port. Between turns
-    // the Done still carries the crash message, never a later transport
-    // error.
+    // was being interrupted or stopped — and end the run, so the next
+    // message starts a fresh server rather than failing against a dead
+    // port. Between turns the Done still carries the crash message, never a
+    // later transport error.
     macro_rules! settle_lost_server {
         ($label:lifetime, $status:expr) => {{
             let message = crate::crash_message("opencode serve", $status, &server.stderr_tail);
@@ -2345,16 +2345,17 @@ async fn run_session(session: Session) {
                 .await;
             }
             settle_children(&mut children, &event_tx, DoneStatus::Interrupted).await;
+            let halted = interrupt_requested || stopping;
             let _ = send(
                 &event_tx,
                 AgentEvent::Done {
-                    status: if interrupt_requested {
+                    status: if halted {
                         DoneStatus::Interrupted
                     } else {
                         DoneStatus::Errored
                     },
                     result: None,
-                    error: (!interrupt_requested).then_some(message),
+                    error: (!halted).then_some(message),
                     session_id: Some(session_id.clone()),
                 },
             )

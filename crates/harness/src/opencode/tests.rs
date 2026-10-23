@@ -3359,3 +3359,166 @@ http.createServer((req, res) => {
     server.shutdown(Duration::from_millis(100)).await;
     assert!(fixture.path().join("raced").exists());
 }
+
+/// A scripted 1.x `opencode serve` with the routes a run needs. `on_prompt`
+/// and `on_abort` are JavaScript run with the request's `res` and an
+/// `emit(payload)` that writes one bus frame.
+#[cfg(unix)]
+fn scripted_opencode(dir: &std::path::Path, on_prompt: &str, on_abort: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let exe = dir.join("opencode");
+    let script = format!(
+        r#"#!/usr/bin/env node
+const http = require('node:http');
+if (process.argv.includes('--version')) {{ console.log('1.18.31'); process.exit(0); }}
+const port = Number(process.argv[process.argv.indexOf('--port') + 1]);
+let bus = null;
+const emit = (payload) => bus && bus.write(`data: ${{JSON.stringify({{payload}})}}\n\n`);
+http.createServer((req, res) => {{
+  const json = (body, status = 200) => {{
+    res.writeHead(status, {{'content-type': 'application/json'}}); res.end(JSON.stringify(body));
+  }};
+  const path = req.url.split('?')[0];
+  if (path === '/global/health') return json({{healthy: true, version: '1.18.31'}});
+  if (path === '/global/event') {{
+    res.writeHead(200, {{'content-type': 'text/event-stream'}});
+    bus = res;
+    emit({{type: 'server.connected', properties: {{}}}});
+    return;
+  }}
+  if (path === '/session' && req.method === 'POST') return json({{id: 'ses_script'}});
+  if (path === '/provider') return json({{all: [], connected: []}});
+  if (path === '/command') return json([]);
+  if (path === '/session/status') return json({{}});
+  if (path.endsWith('/prompt_async')) {{ {on_prompt} return; }}
+  if (path.endsWith('/abort')) {{ {on_abort} return; }}
+  json({{}});
+}}).listen(port, '127.0.0.1', () => console.log(`opencode server listening on http://127.0.0.1:${{port}}`));
+"#
+    );
+    std::fs::write(&exe, script).unwrap();
+    std::fs::set_permissions(&exe, std::fs::Permissions::from_mode(0o700)).unwrap();
+    exe
+}
+
+/// Run `exe` on a one-prompt request; the steering sender keeps the
+/// mailbox open between turns.
+#[cfg(unix)]
+async fn scripted_run(
+    exe: &std::path::Path,
+    cwd: &std::path::Path,
+) -> (
+    BoxStream<'static, Result<AgentEvent, HarnessError>>,
+    crate::TurnControl,
+    mpsc::Sender<crate::SteerMessage>,
+) {
+    let (steer_tx, steering) = mpsc::channel(1);
+    let turn = crate::TurnControl::default();
+    let controls = RunControls {
+        realtime: None,
+        execution_lease: None,
+        request_input: Box::new(|_| tokio::sync::oneshot::channel().1),
+        steering,
+        interrupt: tokio_util::sync::CancellationToken::new(),
+        turn: turn.clone(),
+    };
+    let request: RunRequest = serde_json::from_value(json!({
+        "prompt": "hi", "cwd": cwd.to_str().unwrap(),
+        "sandbox": "workspace-write", "autoApprove": true,
+    }))
+    .unwrap();
+    let harness = OpencodeHarness::new()
+        .with_executable(exe)
+        .with_graces(Duration::from_secs(5), Duration::from_millis(100));
+    (
+        harness.run(request, controls).await.unwrap(),
+        turn,
+        steer_tx,
+    )
+}
+
+/// Events up to and including the next Done.
+#[cfg(unix)]
+async fn until_done(
+    stream: &mut BoxStream<'static, Result<AgentEvent, HarnessError>>,
+) -> Vec<AgentEvent> {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        let mut events = Vec::new();
+        while let Some(event) = stream.next().await {
+            let event = event.unwrap();
+            let done = matches!(event, AgentEvent::Done { .. });
+            events.push(event);
+            if done {
+                return events;
+            }
+        }
+        panic!("stream ended without Done: {events:?}");
+    })
+    .await
+    .unwrap()
+}
+
+/// A server that dies while a stop is settling ends the turn the user
+/// stopped as stopped, not as a failure.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_crash_during_a_stop_settles_interrupted() {
+    let fixture = tempfile::tempdir().unwrap();
+    let exe = scripted_opencode(
+        fixture.path(),
+        "res.writeHead(204); res.end(); \
+         emit({type: 'session.status', properties: {sessionID: 'ses_script', status: {type: 'busy'}}});",
+        "json(true); \
+         setTimeout(() => { console.error('fatal: abort exploded'); process.exit(7); }, 50);",
+    );
+    let (mut stream, turn, _steer) = scripted_run(&exe, fixture.path()).await;
+    // The turn is running once the prompt went out.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    turn.stop_turn();
+    let events = until_done(&mut stream).await;
+    let Some(AgentEvent::Done { status, error, .. }) = events.last() else {
+        unreachable!()
+    };
+    assert_eq!(*status, DoneStatus::Interrupted, "{events:?}");
+    assert_eq!(*error, None);
+}
+
+/// A server that dies between turns ends the run with one Errored Done
+/// carrying its crash (the turn already completed; no error chip of its
+/// own), so the next message starts a fresh server.
+#[cfg(unix)]
+#[tokio::test]
+async fn a_crash_between_turns_reports_the_crash_once() {
+    let fixture = tempfile::tempdir().unwrap();
+    let exe = scripted_opencode(
+        fixture.path(),
+        "res.writeHead(204); res.end(); \
+         const status = (type) => ({type: 'session.status', properties: {sessionID: 'ses_script', status: {type}}}); \
+         emit(status('busy')); emit(status('idle')); \
+         emit({type: 'session.idle', properties: {sessionID: 'ses_script'}}); \
+         setTimeout(() => { console.error('fatal: idle exploded'); process.exit(7); }, 300);",
+        "json(true);",
+    );
+    let (mut stream, _turn, _steer) = scripted_run(&exe, fixture.path()).await;
+    let first = until_done(&mut stream).await;
+    assert!(
+        matches!(
+            first.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{first:?}"
+    );
+    let crash = until_done(&mut stream).await;
+    assert_eq!(crash.len(), 1, "{crash:?}");
+    let Some(AgentEvent::Done { status, error, .. }) = crash.last() else {
+        unreachable!()
+    };
+    assert_eq!(*status, DoneStatus::Errored);
+    let error = error.as_deref().unwrap();
+    assert!(error.contains("idle exploded"), "{error}");
+    let rest = tokio::time::timeout(Duration::from_secs(5), stream.next()).await;
+    assert!(matches!(rest, Ok(None)), "{rest:?}");
+}
