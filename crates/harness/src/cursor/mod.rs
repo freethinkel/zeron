@@ -65,6 +65,12 @@ const SHIM_SOURCE: &str = include_str!("shim.mjs");
 /// closes as stopped and the shim is retired; the next message resumes the
 /// agent in a fresh one.
 const DEFAULT_STOP_TIMEOUT: Duration = Duration::from_secs(12);
+/// Inline image caps for one message, in bytes: per image and all together.
+/// The SDK's send goes silent for good on a large inlined image (live,
+/// 1.0.32: 8.7 MB went through, 14.5 MB got no update in 400s+). A file over
+/// either rides as the path ref already in the text, which the agent can read.
+const INLINE_IMAGE_MAX: u64 = 4 * 1024 * 1024;
+const INLINE_IMAGES_TOTAL: u64 = 8 * 1024 * 1024;
 
 fn cursor_cli_paths() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
@@ -417,7 +423,7 @@ impl Harness for CursorHarness {
         let (stdin_tx, stdin_rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(stdin_writer(stdin, stdin_rx));
         // The SDK takes images with the text; the path refs ride the text too.
-        let images = crate::pi::load_images(&request.attachments).await;
+        let images = load_images(&request.attachments).await;
         let first = json!({
             "op": "run",
             "prompt": request.prompt,
@@ -430,6 +436,9 @@ impl Harness for CursorHarness {
             "mcp": request.mcp,
             "storeDir": lease.as_ref().and_then(|lease| lease.store_dir.as_ref()),
             "images": images,
+            // One send can batch several messages' images; the shim keeps
+            // each send under the same total.
+            "imageBudget": INLINE_IMAGES_TOTAL,
         });
         let _ = stdin_tx.send(first.to_string());
 
@@ -585,6 +594,11 @@ fn map_model_items(items: &Value) -> Vec<Model> {
             })
         })
         .collect()
+}
+
+/// A message's attachments as inline image blocks, under the caps.
+async fn load_images(attachments: &[String]) -> Value {
+    crate::pi::load_images_capped(attachments, INLINE_IMAGE_MAX, INLINE_IMAGES_TOTAL).await
 }
 
 async fn stdin_writer(mut stdin: ChildStdin, mut rx: mpsc::UnboundedReceiver<String>) {
@@ -827,7 +841,7 @@ async fn run_session(session: Session) {
                     any_done = false;
                     let mut line = json!({ "op": "steer", "prompt": msg.prompt });
                     if !msg.attachments.is_empty() {
-                        line["images"] = crate::pi::load_images(&msg.attachments).await;
+                        line["images"] = load_images(&msg.attachments).await;
                     }
                     // A changed model runs from this message's own turn.
                     if let Some(mut next) = msg.config {

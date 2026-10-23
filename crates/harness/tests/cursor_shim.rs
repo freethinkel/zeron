@@ -1031,3 +1031,22 @@ async fn a_stop_during_agent_creation_settles_once() {
     finish(&mut child, stdin).await;
     assert!(fixture.prompts().is_empty());
 }
+
+/// Images batched into one send stay under the engine's inline budget.
+#[tokio::test]
+async fn one_send_inlines_images_only_up_to_the_budget() {
+    let fixture = SessionFixture::new();
+    let image = serde_json::json!({"type":"image","data":"aGk=","mimeType":"image/png"});
+    let (mut child, stdin, mut lines) = fixture
+        .start_frame(
+            "image",
+            serde_json::json!({"images": [image, image], "imageBudget": 3}),
+        )
+        .await;
+    let frames = turn_frames(&mut lines).await;
+    assert!(
+        frames.iter().any(|f| f["text"] == " images:image/png/aGk="),
+        "{frames:?}"
+    );
+    finish(&mut child, stdin).await;
+}

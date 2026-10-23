@@ -780,3 +780,30 @@ async fn attachments_reach_the_shim_as_image_blocks() {
     .expect("both turns finished");
     assert_eq!(texts, ["steer image"]);
 }
+
+/// Images over the per-image or per-message inline cap ride as path refs only.
+#[tokio::test]
+async fn oversized_attachments_are_not_inlined() {
+    let dir = tempfile::tempdir().unwrap();
+    let big = dir.path().join("big.png");
+    let mut bytes = b"\x89PNG\r\n\x1a\n".to_vec();
+    bytes.resize(5 * 1024 * 1024, 0);
+    std::fs::write(&big, bytes).unwrap();
+    let small = dir.path().join("small.png");
+    std::fs::write(&small, b"\x89PNG\r\n\x1a\nsmall").unwrap();
+    let mut req = request("scenario:image-cap");
+    req.attachments = vec![big.display().to_string(), small.display().to_string()];
+    let (controls, _steer, _token) = controls();
+    let events = run_to_first_done(&harness(), req, controls).await;
+    assert!(
+        matches!(
+            events.last(),
+            Some(AgentEvent::Done {
+                status: DoneStatus::Completed,
+                ..
+            })
+        ),
+        "{events:?}"
+    );
+}
+

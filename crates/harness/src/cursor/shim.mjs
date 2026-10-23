@@ -11,8 +11,11 @@
 //
 // Protocol: JSONL, one frame per line.
 //   stdin  (engine → shim):
-//     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?,"images"?}
-//                                                       start / first turn
+//     {"op":"run","prompt","cwd","model"?,"modelOptions"?,"resume"?,"images"?,
+//      "imageBudget"?}
+//                                                       start / first turn;
+//                                                       `imageBudget` = bytes of
+//                                                       images one send inlines
 //     {"op":"user","prompt"}                            explicit next turn
 //     {"op":"steer","prompt","model"?,"modelOptions"?,"reconfigure"?,"images"?}
 //                                                       native mid-turn input;
@@ -625,6 +628,19 @@ async function followupSteers() {
     }, undelivered.flatMap(message => message.images));
   }
 }
+// Bytes of images one send may inline: set by the engine's run frame.
+let imageBudget = Infinity;
+// Several messages' images can ride one send (a batched follow-up). Past the
+// budget the rest ride as the path refs already in their text.
+function withinBudget(images) {
+  let left = imageBudget;
+  return images.filter(({ data }) => {
+    const bytes = Math.floor(data.length * 3 / 4);
+    if (bytes > left) return false;
+    left -= bytes;
+    return true;
+  });
+}
 // `{type, data, mimeType}` blocks from the engine → the SDK's image shape.
 function sdkImages(images) {
   return (Array.isArray(images) ? images : [])
@@ -643,6 +659,7 @@ function acceptSteer(message) {
 }
 
 async function runTurn(prompt, ready, accepted, images = []) {
+  images = withinBudget(images);
   turnActive = true;
   if (closing) return;
   try {
@@ -755,6 +772,7 @@ function modelSelection(msg) {
 }
 
 async function start(msg) {
+  if (Number.isFinite(msg.imageBudget) && msg.imageBudget >= 0) imageBudget = msg.imageBudget;
   const model = modelSelection(msg);
   currentModel = model;
   // The SDK loads NO ambient settings unless asked: without settingSources the

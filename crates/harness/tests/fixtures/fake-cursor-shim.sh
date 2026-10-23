@@ -149,6 +149,17 @@ case "$first" in
   read -r next || exit 0
   ;;
 
+*scenario:image-cap*)
+  # Only the small attachment is inlined; the large one rides as a path ref.
+  case "$first" in
+    *'"images":[{"data":"iVBORw0KGgpzbWFsbA==","mimeType":"image/png","type":"image"}]'*) ;;
+    *) emit '{"ev":"fatal","message":"image caps not applied"}'; exit 1 ;;
+  esac
+  emit '{"ev":"ready","agentId":"agent-img","model":"auto"}'
+  emit '{"ev":"turn","status":"finished"}'
+  read -r next || exit 0
+  ;;
+
 *scenario:interrupt-fatal*)
   emit '{"ev":"ready","agentId":"agent-int-fatal","model":"auto"}'
   emit '{"ev":"text","text":"working"}'
