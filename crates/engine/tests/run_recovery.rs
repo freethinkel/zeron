@@ -7,7 +7,8 @@
 //! - a transient start failure retries with backoff, a deterministic one
 //!   surfaces at once;
 //! - a resume id the provider says is gone is retried once in a fresh
-//!   session, which then replaces the stored id.
+//!   session (never the dead id again, whichever record still names it, and
+//!   the reply says so), which then replaces the stored id.
 
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -134,6 +135,38 @@ impl Harness for ScriptedHarness {
         };
         let events = (self.script)(&request, call)?;
         Ok(futures::stream::iter(events.into_iter().map(Ok)).boxed())
+    }
+}
+
+/// A [`ScriptedHarness`] registered as another provider.
+struct AsProvider(HarnessId, ScriptedHarness);
+
+#[async_trait]
+impl Harness for AsProvider {
+    fn id(&self) -> HarnessId {
+        self.0
+    }
+    fn display_name(&self) -> &str {
+        self.0.as_str()
+    }
+    fn supports_steering(&self) -> bool {
+        false
+    }
+    fn steering_mode(&self) -> SteeringMode {
+        SteeringMode::TurnBoundary
+    }
+    fn reasoning_levels(&self) -> &[ReasoningLevel] {
+        &[ReasoningLevel::Medium]
+    }
+    async fn models(&self) -> Result<Vec<Model>, HarnessError> {
+        Ok(vec![])
+    }
+    async fn run(
+        &self,
+        request: RunRequest,
+        controls: RunControls,
+    ) -> Result<BoxStream<'static, Result<AgentEvent, HarnessError>>, HarnessError> {
+        self.1.run(request, controls).await
     }
 }
 
@@ -861,5 +894,72 @@ async fn a_resume_the_provider_rejects_retries_in_a_fresh_session() {
         requests.lock().unwrap()[3].resume.as_deref(),
         Some("hs-fresh")
     );
+    core.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_rejected_resume_in_a_switched_chat_starts_fresh_and_says_so() {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = data_dir(&tmp);
+    let mock_log: RequestLog = Default::default();
+    let pi_log: RequestLog = Default::default();
+    let registry = HarnessRegistry::new();
+    registry.register(Arc::new(ScriptedHarness::completing(&mock_log, "hs-mock")));
+    // Pi's first session is lost after a while; every later one sticks.
+    registry.register(Arc::new(AsProvider(
+        HarnessId::Pi,
+        ScriptedHarness {
+            requests: pi_log.clone(),
+            script: Arc::new(|request, call| {
+                Ok(match (call, request.resume.as_deref()) {
+                    (0, _) => completed_turn("hs-pi", "pi answer"),
+                    (_, Some("hs-pi")) => vec![AgentEvent::Done {
+                        status: DoneStatus::Errored,
+                        result: None,
+                        error: Some("Pi exited unexpectedly: session not found: hs-pi".into()),
+                        session_id: None,
+                    }],
+                    _ => completed_turn("hs-pi-2", "pi again"),
+                })
+            }),
+        },
+    )));
+    let core = EngineCore::assemble(&dir, Arc::new(registry), HarnessId::Mock, None)
+        .expect("engine core assembles");
+    pre_title(&core);
+    let turn = |harness, prompt: &'static str, id: &'static str, replies| {
+        let core = &core;
+        async move {
+            core.sessions
+                .dispatch(CHAT, harness, run_request(prompt), Some(id.into()))
+                .await
+                .unwrap();
+            wait_for(|| complete_assistant_count(core) == replies, prompt).await;
+            // The provider marks ride the Done; let them land.
+            tokio::time::sleep(Duration::from_millis(30)).await;
+        }
+    };
+    turn(HarnessId::Mock, "one", "msg-user-1", 1).await;
+    turn(HarnessId::Pi, "two", "msg-user-2", 2).await;
+    turn(HarnessId::Mock, "three", "msg-user-3", 3).await;
+    // Back on Pi: the chat's record of Pi's session names `hs-pi`, gone now.
+    turn(HarnessId::Pi, "four", "msg-user-4", 4).await;
+    {
+        let log = pi_log.lock().unwrap();
+        assert_eq!(log.len(), 3, "{log:#?}");
+        assert_eq!(log[1].resume.as_deref(), Some("hs-pi"));
+        assert_eq!(log[2].resume, None, "the retry never resumes the dead id");
+    }
+    let reply = entries_now(&core).pop().unwrap();
+    assert_eq!(reply.role, MessageRole::Assistant);
+    let notes = error_notes(&reply);
+    assert!(
+        notes.iter().any(|n| n.contains("starts a new one")),
+        "the reply says the session started over: {notes:?}"
+    );
+    // The new session replaces the dead one.
+    turn(HarnessId::Mock, "five", "msg-user-5", 5).await;
+    turn(HarnessId::Pi, "six", "msg-user-6", 6).await;
+    assert_eq!(pi_log.lock().unwrap()[3].resume.as_deref(), Some("hs-pi-2"));
     core.shutdown().await;
 }

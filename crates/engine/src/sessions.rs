@@ -283,6 +283,14 @@ struct Inner {
     /// (zeron kept the same pair on `chats.harness_session_id`). An empty
     /// session id is the "do not resume" tombstone after a rejected resume.
     harness_sessions: Mutex<HashMap<String, HarnessSessionRef>>,
+    /// Per chat: session ids the provider said it no longer has. Never
+    /// resumed again from any source — the per-provider record a switched
+    /// chat keeps would otherwise hand the dead id straight back — until a
+    /// new session replaces them (in memory only, like the tombstone).
+    rejected_resumes: Mutex<HashMap<String, std::collections::HashSet<String>>>,
+    /// Chats whose next run starts over after a rejected resume, owed a
+    /// notice in the transcript that the earlier session is gone.
+    fresh_start_notices: Mutex<std::collections::HashSet<String>>,
     /// Auto-titler for untitled chats (wired at engine assembly; absent in bare tests).
     titles: OnceLock<crate::titles::TitleGenerator>,
     generated_images: OnceLock<(crate::uploads::Uploads, std::path::PathBuf)>,
@@ -335,6 +343,8 @@ impl SessionsEngine {
                 activity_task: Mutex::new(None),
                 last_requests: Mutex::new(HashMap::new()),
                 harness_sessions: Mutex::new(HashMap::new()),
+                rejected_resumes: Mutex::new(HashMap::new()),
+                fresh_start_notices: Mutex::new(std::collections::HashSet::new()),
                 titles: OnceLock::new(),
                 generated_images: OnceLock::new(),
                 scratch_root: OnceLock::new(),
@@ -891,12 +901,17 @@ impl SessionsEngine {
         // startup-crash retry injects too — a stale id is the harness's
         // problem now (`session/load` falls back to `session/new` internally),
         // and starting the retry fresh silently dropped a good conversation.
+        // An id the provider has rejected is skipped wherever it comes from.
         let mut resume_injected = false;
         if request.resume.is_none() {
+            let live = |id: &String| !self.inner.resume_was_rejected(chat_id, id);
             request.resume = self
                 .inner
                 .resume_for(chat_id, &request.cwd, harness_id)
-                .or_else(|| Inner::own_provider_session(handle.doc(), harness_id, &request.cwd));
+                .filter(live)
+                .or_else(|| {
+                    Inner::own_provider_session(handle.doc(), harness_id, &request.cwd).filter(live)
+                });
             resume_injected = request.resume.is_some();
         }
         // A continuation only means something to the session that holds the
@@ -2278,6 +2293,43 @@ impl Inner {
         cut
     }
 
+    /// Whether the provider has said it no longer has `chat_id`'s session
+    /// `session_id` (see [`Self::reject_resume`]).
+    fn resume_was_rejected(&self, chat_id: &str, session_id: &str) -> bool {
+        lock(&self.rejected_resumes)
+            .get(chat_id)
+            .is_some_and(|ids| ids.contains(session_id))
+    }
+
+    /// The provider no longer has `session_id`: the chat's next run of
+    /// `harness` starts a fresh session, and says so in the transcript.
+    fn reject_resume(
+        &self,
+        chat_id: &str,
+        session_id: Option<&str>,
+        harness: HarnessId,
+        cwd: &str,
+    ) {
+        // The "do not resume" tombstone: the fresh run's SessionStarted
+        // replaces it, and nothing durable is lost if that run fails too (a
+        // restart re-reads the stored id).
+        lock(&self.harness_sessions).insert(
+            chat_id.to_string(),
+            HarnessSessionRef {
+                session_id: String::new(),
+                cwd: cwd.to_string(),
+                harness: Some(harness),
+            },
+        );
+        if let Some(id) = session_id.filter(|id| !id.is_empty()) {
+            lock(&self.rejected_resumes)
+                .entry(chat_id.to_string())
+                .or_default()
+                .insert(id.to_string());
+        }
+        lock(&self.fresh_start_notices).insert(chat_id.to_string());
+    }
+
     /// Whether the last turn journaled for `chat_id` is one the shutdown cut
     /// off: its last `Done` carries [`SHUTDOWN_NOTE`].
     fn ended_by_shutdown(&self, chat_id: &str) -> bool {
@@ -2674,6 +2726,11 @@ fn revival_prompt(harness: HarnessId, original: &str) -> String {
 
 /// The note a turn the engine's own shutdown cut off ends with.
 const SHUTDOWN_NOTE: &str = "Run interrupted by engine shutdown";
+
+/// The note a reply opens with when the provider no longer had the session
+/// the run asked to resume.
+const FRESH_START_NOTICE: &str = "The provider no longer has this chat's earlier session, \
+                                  so this reply starts a new one";
 
 /// Backoff before each retry of a transient start failure.
 const SPAWN_RETRY_DELAYS: [std::time::Duration; 3] = [
@@ -3099,6 +3156,7 @@ async fn drive_run(
     let harness_id = harness.id();
     let user_prompt = request.prompt.clone();
     let run_cwd = request.cwd.clone();
+    let resumed_session = request.resume.clone();
     if request.resume.is_none() {
         let _ = doc.clear_context_usage();
     }
@@ -3173,6 +3231,16 @@ async fn drive_run(
         }
     }
     let mut prepared_events = std::collections::VecDeque::new();
+    // The provider lost the conversation this run was meant to resume: the
+    // reply opens by saying it starts over in a new session.
+    if !resume_state.idle
+        && resumed_session.is_none()
+        && lock(&inner.fresh_start_notices).remove(&chat_id)
+    {
+        prepared_events.push_back(AgentEvent::Error {
+            message: FRESH_START_NOTICE.into(),
+        });
+    }
     let mut entry_id = new_id();
     let mut segment_started = now_ms();
     let mut writer: Option<SegmentWriter<'_>> = None;
@@ -4181,17 +4249,7 @@ async fn drive_run(
                     chat = %chat_id,
                     "provider no longer has the resumed session; retrying once in a fresh one"
                 );
-                // The in-memory "do not resume" tombstone: the fresh run's
-                // SessionStarted replaces it, and nothing durable is lost if
-                // that run fails too (a restart re-reads the stored id).
-                lock(&inner.harness_sessions).insert(
-                    chat_id.clone(),
-                    HarnessSessionRef {
-                        session_id: String::new(),
-                        cwd: run_cwd.clone(),
-                        harness: Some(harness_id),
-                    },
-                );
+                inner.reject_resume(&chat_id, resumed_session.as_deref(), harness_id, &run_cwd);
             } else {
                 tracing::warn!(
                     chat = %chat_id,
