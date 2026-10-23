@@ -902,12 +902,17 @@ const MIN_CODEX_VERSION: semver::Version = semver::Version::new(0, 146, 0);
 
 /// `Err` when `version` is known and older than [`MIN_CODEX_VERSION`]; an
 /// unknown version (a wrapper, a dev build) is given the benefit of the doubt.
+/// A pre-release counts as its release: `0.146.0-alpha.2` already speaks the
+/// wire, though semver orders it before `0.146.0`.
 fn check_codex_version(version: Option<&semver::Version>) -> Result<(), HarnessError> {
-    match version {
-        Some(version) if *version < MIN_CODEX_VERSION => Err(HarnessError::Protocol(format!(
-            "Codex CLI {version} is too old; update it to {MIN_CODEX_VERSION} or newer \
-             (npm install -g @openai/codex@latest)"
-        ))),
+    let release = version.map(|v| semver::Version::new(v.major, v.minor, v.patch));
+    match (version, release) {
+        (Some(version), Some(release)) if release < MIN_CODEX_VERSION => {
+            Err(HarnessError::Protocol(format!(
+                "Codex CLI {version} is too old; update it to {MIN_CODEX_VERSION} or newer \
+                 (npm install -g @openai/codex@latest)"
+            )))
+        }
         _ => Ok(()),
     }
 }
@@ -2819,6 +2824,11 @@ mod tests {
         assert!(check_codex_version(None).is_ok());
         assert!(check_codex_version(Some(&semver::Version::new(0, 164, 0))).is_ok());
         assert!(check_codex_version(Some(&MIN_CODEX_VERSION)).is_ok());
+        // A pre-release of the minimum is that release, not an older one.
+        let alpha = semver::Version::parse("0.146.0-alpha.2").unwrap();
+        assert!(check_codex_version(Some(&alpha)).is_ok());
+        let old_alpha = semver::Version::parse("0.145.0-alpha.9").unwrap();
+        assert!(check_codex_version(Some(&old_alpha)).is_err());
         let err = check_codex_version(Some(&semver::Version::new(0, 120, 3)))
             .unwrap_err()
             .to_string();
