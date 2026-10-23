@@ -602,16 +602,16 @@ pub use pi::PiHarness;
 /// Windows' job object already owns the whole tree.
 pub(crate) async fn shutdown_agent(
     child: &mut process::Child,
-    earlier: Vec<i32>,
+    earlier: Vec<process::Tracked>,
     kill_grace: std::time::Duration,
 ) {
     #[cfg(unix)]
     {
         let mut tree = earlier;
         if let Some(pid) = child.id() {
-            for pid in process::descendants(pid).await {
-                if !tree.contains(&pid) {
-                    tree.push(pid);
+            for found in process::descendants(pid).await {
+                if !tree.contains(&found) {
+                    tree.push(found);
                 }
             }
         }

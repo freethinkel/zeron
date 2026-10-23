@@ -57,7 +57,7 @@ impl Child {
     /// orphans can no longer be traced from it.
     pub(crate) async fn shutdown_with(
         &mut self,
-        #[cfg_attr(not(unix), allow(unused_mut))] mut earlier: Vec<i32>,
+        #[cfg_attr(not(unix), allow(unused_mut))] mut earlier: Vec<crate::process::Tracked>,
         grace: std::time::Duration,
     ) {
         // Everything the agent started, taken while it is still attached:
@@ -66,9 +66,9 @@ impl Child {
         #[cfg(unix)]
         let tree = {
             if let (Some(_), Some(pid)) = (self.group, self.inner.id()) {
-                for pid in crate::process::descendants(pid).await {
-                    if !earlier.contains(&pid) {
-                        earlier.push(pid);
+                for found in crate::process::descendants(pid).await {
+                    if !earlier.contains(&found) {
+                        earlier.push(found);
                     }
                 }
             }
@@ -195,7 +195,10 @@ mod tests {
         let mut child = Child::new(command.spawn().unwrap());
         child.wait().await.unwrap();
         child
-            .shutdown_with(vec![orphan_pid], std::time::Duration::from_secs(2))
+            .shutdown_with(
+                vec![crate::process::Tracked::now(orphan_pid)],
+                std::time::Duration::from_secs(2),
+            )
             .await;
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
         while orphan.try_wait().unwrap().is_none() {

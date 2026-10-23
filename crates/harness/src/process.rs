@@ -58,6 +58,29 @@ pub(crate) fn signal_target(child: &Child) -> Option<std::sync::Arc<crate::windo
     Some(child.job.clone())
 }
 
+/// One process a descendant snapshot found: its pid and, where the process
+/// table reports it, its start time, which tells it apart from an unrelated
+/// process that later inherits the pid. Each snapshot carries its own
+/// identities to [`terminate_tree`]: runs never share or overwrite them.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
+pub(crate) struct Tracked {
+    pub(crate) pid: i32,
+    start: Option<u64>,
+}
+
+#[cfg(unix)]
+impl Tracked {
+    /// `pid` as the process table describes it right now.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn now(pid: i32) -> Self {
+        Self {
+            pid,
+            start: proc_table::start_time(pid),
+        }
+    }
+}
+
 /// Every live descendant of `root` — children, grandchildren, … — from one
 /// process-table snapshot. Agent CLIs start each shell in its OWN process
 /// group (Claude's background Bash, Codex's exec sessions), so neither a
@@ -66,11 +89,11 @@ pub(crate) fn signal_target(child: &Child) -> Option<std::sync::Arc<crate::windo
 /// stop and SIGTERM both leave the shell running). Snapshot while the agent
 /// is alive: once it exits, its orphans are reparented and untraceable.
 ///
-/// Each descendant's start time is recorded with it, so [`terminate_tree`]
-/// can tell the process it found from an unrelated one that inherited the
-/// pid after it exited.
+/// Each descendant carries its start time, so [`terminate_tree`] can tell
+/// the process it found from an unrelated one that inherited the pid after
+/// it exited.
 #[cfg(unix)]
-pub(crate) async fn descendants(root: u32) -> Vec<i32> {
+pub(crate) async fn descendants(root: u32) -> Vec<Tracked> {
     let mut table = tokio::task::spawn_blocking(proc_table::read)
         .await
         .unwrap_or_default();
@@ -78,14 +101,16 @@ pub(crate) async fn descendants(root: u32) -> Vec<i32> {
         // No /proc or libproc view (or a sandbox hid it): ask ps.
         table = ps_table().await;
     }
-    let found = tree_of(root as i32, &table);
-    identities::record(
-        table
-            .iter()
-            .filter(|entry| found.contains(&entry.pid))
-            .filter_map(|entry| Some((entry.pid, entry.start?))),
-    );
-    found
+    tree_of(root as i32, &table)
+        .into_iter()
+        .map(|pid| Tracked {
+            pid,
+            start: table
+                .iter()
+                .find(|entry| entry.pid == pid)
+                .and_then(|entry| entry.start),
+        })
+        .collect()
 }
 
 /// One process-table row; `start` identifies the process across pid reuse.
@@ -249,42 +274,6 @@ mod proc_table {
 /// Start times recorded by [`descendants`] snapshots, consulted before every
 /// signal [`terminate_tree`] sends. The shared drivers pass bare pids
 /// between the two, so the identity travels here.
-#[cfg(unix)]
-mod identities {
-    use std::collections::HashMap;
-    use std::sync::{Mutex, OnceLock};
-
-    /// Snapshots whose teardown never ran (a run that ended cleanly) leave
-    /// entries behind; past this size dead ones are pruned.
-    const PRUNE_AT: usize = 4096;
-
-    fn map() -> std::sync::MutexGuard<'static, HashMap<i32, u64>> {
-        static MAP: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
-        MAP.get_or_init(Default::default)
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-    }
-
-    pub(super) fn record(entries: impl IntoIterator<Item = (i32, u64)>) {
-        let mut map = map();
-        map.extend(entries);
-        if map.len() > PRUNE_AT {
-            map.retain(|&pid, start| super::proc_table::start_time(pid) == Some(*start));
-        }
-    }
-
-    pub(super) fn get(pid: i32) -> Option<u64> {
-        map().get(&pid).copied()
-    }
-
-    pub(super) fn forget(pids: &[i32]) {
-        let mut map = map();
-        for pid in pids {
-            map.remove(pid);
-        }
-    }
-}
-
 /// Whether `pid` is still the process a snapshot found: same start time when
 /// one was recorded, merely alive otherwise.
 #[cfg(unix)]
@@ -296,14 +285,14 @@ fn still_same(pid: i32, recorded: Option<u64>) -> bool {
     }
 }
 
-/// Terminate `pids` and the process groups they lead: SIGTERM, then SIGKILL
-/// whatever is still running after `grace`. A pid whose process has exited
-/// and been reused by another is never signaled.
+/// Terminate `tracked` processes and the process groups they lead: SIGTERM,
+/// then SIGKILL whatever is still running after `grace`. A pid whose process
+/// has exited and been reused by another is never signaled.
 #[cfg(unix)]
-pub(crate) async fn terminate_tree(pids: &[i32], grace: std::time::Duration) {
-    let recorded: Vec<(i32, Option<u64>)> = pids
+pub(crate) async fn terminate_tree(tracked: &[Tracked], grace: std::time::Duration) {
+    let recorded: Vec<(i32, Option<u64>)> = tracked
         .iter()
-        .map(|&pid| (pid, identities::get(pid)))
+        .map(|process| (process.pid, process.start))
         .collect();
     // A group leader's whole group (its own children included); anything
     // else by pid. A leader verified now names its group for as long as the
@@ -345,7 +334,6 @@ pub(crate) async fn terminate_tree(pids: &[i32], grace: std::time::Duration) {
             crate::send_signal(&target.0, crate::Signal::Kill);
         }
     }
-    identities::forget(pids);
 }
 
 #[cfg(test)]
@@ -412,7 +400,7 @@ mod tests {
         let _reap = Reap(shell);
         assert_eq!(unsafe { libc::getpgid(shell) }, shell);
         let tree = descendants(root).await;
-        assert!(tree.contains(&shell), "{tree:?}");
+        assert!(tree.iter().any(|found| found.pid == shell), "{tree:?}");
         // The parent dies hard (an unresponsive agent's SIGKILL): the shell
         // is orphaned, not killed.
         parent.kill().await.unwrap();
@@ -464,14 +452,16 @@ mod tests {
             .unwrap();
         let pid = child.id().unwrap() as i32;
         let start = proc_table::start_time(pid).unwrap();
-        identities::record([(pid, start + 1)]);
-        terminate_tree(&[pid], std::time::Duration::from_millis(200)).await;
+        let impostor = Tracked {
+            pid,
+            start: Some(start + 1),
+        };
+        terminate_tree(&[impostor], std::time::Duration::from_millis(200)).await;
         assert!(
             child.try_wait().unwrap().is_none(),
             "an impostor pid was signaled"
         );
-        identities::record([(pid, start)]);
-        terminate_tree(&[pid], std::time::Duration::from_millis(200)).await;
+        terminate_tree(&[Tracked::now(pid)], std::time::Duration::from_millis(200)).await;
         let status = tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
             .await
             .expect("the verified process is ended")
