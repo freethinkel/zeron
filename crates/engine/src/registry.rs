@@ -879,8 +879,8 @@ fn full_registry() -> HarnessRegistry {
         HarnessDescriptor {
             id: HarnessId::Muse,
             name: "Muse".into(),
-            supports_steering: false,
-            steering_mode: SteeringMode::TurnBoundary,
+            supports_steering: true,
+            steering_mode: SteeringMode::StepBoundary,
             reasoning_levels: Vec::new(),
             installed: true,
             can_install: false,
