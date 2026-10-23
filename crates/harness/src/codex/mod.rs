@@ -940,6 +940,12 @@ async fn setup_failure(
     if !client.is_closed() || !transport_lost(&error) {
         return error.to_string();
     }
+    crash_report(child, stderr_tail).await
+}
+
+/// The exited app-server's status and last stderr lines, once its stderr
+/// has drained and it has been reaped (each briefly waited for).
+async fn crash_report(child: &mut Child, stderr_tail: &crate::StderrTail) -> String {
     stderr_tail.wait_closed().await;
     let status = match tokio::time::timeout(Duration::from_millis(500), child.wait()).await {
         Ok(Ok(status)) => Some(status),
@@ -2277,17 +2283,19 @@ async fn run_session(session: Session) {
         } else if !interrupted && !done_current {
             // A child KILLED mid-turn (OS memory pressure, `killall codex`)
             // must not read as a silent success — codex.ts's signal-death
-            // handling, reduced to the turn-in-flight case.
-            let status = child.try_wait().ok().flatten();
+            // handling, reduced to the turn-in-flight case. A final error
+            // the turn already reported (and its end never came to carry)
+            // leads: it is usually why the turn went nowhere.
+            let crash = crash_report(&mut child, &stderr_tail).await;
+            let error = match held_error.take() {
+                Some(held) => format!("{held}\n\n{crash}"),
+                None => crash,
+            };
             let _ = event_tx
                 .send(Ok(AgentEvent::Done {
                     status: DoneStatus::Errored,
                     result: None,
-                    error: Some(crate::crash_message(
-                        "codex app-server",
-                        status,
-                        &stderr_tail,
-                    )),
+                    error: Some(error),
                     session_id: Some(thread_id.clone()),
                 }))
                 .await;

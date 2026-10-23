@@ -572,6 +572,15 @@ case "$turnline" in
   emit '{"method":"turn/completed","params":{"threadId":"th-1","turn":{"id":"t-1","status":"failed","error":{"message":"You have hit your usage limit.","codexErrorInfo":"usageLimitExceeded"}}}}'
   ;;
 
+*scenario:crash-after-error*)
+  # A final error, then the app-server dies before the turn's end.
+  emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"
+  emit '{"method":"turn/started","params":{"threadId":"th-1","turn":{"id":"t-1"}}}'
+  emit '{"method":"error","params":{"threadId":"th-1","turnId":"t-1","willRetry":false,"error":{"message":"unexpected status 401 Unauthorized: Incorrect API key provided","codexErrorInfo":{"httpConnectionFailed":{"httpStatusCode":401}}}}}'
+  echo 'thread main panicked at session.rs: lost the model client' >&2
+  exit 3
+  ;;
+
 *scenario:foreign-interrupt*)
   # Interrupted by another client of the thread, not by us.
   emit "{\"id\":$tid,\"result\":{\"turn\":{\"id\":\"t-1\"}}}"

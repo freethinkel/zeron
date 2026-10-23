@@ -911,6 +911,41 @@ async fn retry_notices_stay_out_of_the_transcript_and_the_final_error_lands_once
     );
 }
 
+/// A final error the app-server reported before dying mid-turn is not lost
+/// with the turn's end: the crash Done carries it, ahead of the exit and
+/// the stderr it printed.
+#[tokio::test]
+async fn a_crash_after_a_final_error_reports_both() {
+    let (controls, _steer, _token) = controls("Yes");
+    let events = run_to_end(&harness(), request("scenario:crash-after-error"), controls).await;
+    assert!(
+        !events.iter().any(|e| matches!(e, AgentEvent::Error { .. })),
+        "{events:?}"
+    );
+    match events.last() {
+        Some(AgentEvent::Done {
+            status: DoneStatus::Errored,
+            error: Some(error),
+            ..
+        }) => {
+            assert!(
+                error.starts_with("Codex's credentials were rejected. Run codex login"),
+                "{error}"
+            );
+            assert!(
+                error.contains("codex app-server exited unexpectedly")
+                    && error.contains("lost the model client"),
+                "{error}"
+            );
+            assert_eq!(
+                zeron_proto::run_errors::provider_problem(error),
+                Some(zeron_proto::run_errors::ProviderProblem::SignedOut)
+            );
+        }
+        other => panic!("expected an errored Done, got {other:?}"),
+    }
+}
+
 #[tokio::test]
 async fn a_turn_interrupted_elsewhere_is_not_a_completed_answer() {
     let (controls, _steer, _token) = controls("Yes");
