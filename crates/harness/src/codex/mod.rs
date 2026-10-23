@@ -74,7 +74,7 @@ use zeron_proto::{
     RunRequest, SlashCommand, SteeringMode, UserInputAnswer, UserInputQuestion,
 };
 
-use crate::jsonrpc::{Incoming, RpcClient};
+use crate::jsonrpc::{Incoming, RpcClient, transport_lost};
 use crate::process::{Child, Command, Stdio};
 use crate::{Harness, HarnessError, RunControls};
 use catalog::{REASONING_LEVELS, sandbox_mode, sandbox_policy_value, static_models, to_effort};
@@ -955,14 +955,6 @@ async fn setup_failure(
         _ => child.try_wait().ok().flatten(),
     };
     crate::crash_message("codex app-server", status, stderr_tail)
-}
-
-/// The request never got an answer: the app-server is gone (the wire's
-/// own errors for that, see [`RpcClient::request`]).
-fn transport_lost(error: &HarnessError) -> bool {
-    matches!(error, HarnessError::Protocol(message)
-        if message.ends_with("app-server exited before responding")
-            || message.ends_with("app-server stdin closed"))
 }
 
 /// Whether a `thread/resume` failure means the conversation is gone for
@@ -2830,6 +2822,13 @@ mod tests {
         }
         assert!(transport_lost(&protocol(
             "thread/start: app-server exited before responding"
+        )));
+        // A failed write names its cause after the wire's own words.
+        assert!(transport_lost(&protocol(
+            "thread/resume: app-server stdin closed (Broken pipe (os error 32))"
+        )));
+        assert!(!resume_unrecoverable(&protocol(
+            "thread/resume: app-server stdin closed (Broken pipe (os error 32))"
         )));
         assert!(!transport_lost(&protocol("thread/start: bad request")));
     }

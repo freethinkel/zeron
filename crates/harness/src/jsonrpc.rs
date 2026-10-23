@@ -46,6 +46,23 @@ type StdoutObserver = Box<dyn Fn(&str) + Send>;
 
 type Pending = Arc<Mutex<HashMap<i64, oneshot::Sender<Result<Value, String>>>>>;
 
+/// How a request fails when the transport lost its answer: the app server
+/// exited first, or its stdin could not take the request (then with the
+/// write error after it). [`transport_lost`] recognizes both.
+const EXITED: &str = "app-server exited before responding";
+const STDIN_CLOSED: &str = "app-server stdin closed";
+
+/// The request never got an answer because the app server is gone, as
+/// opposed to an answer that refused it.
+pub(crate) fn transport_lost(error: &HarnessError) -> bool {
+    let HarnessError::Protocol(message) = error else {
+        return false;
+    };
+    message
+        .split_once(": ")
+        .is_some_and(|(_, reason)| reason.starts_with(EXITED) || reason.starts_with(STDIN_CLOSED))
+}
+
 /// Where realtime voice notifications go instead of the session channel.
 struct VoiceRouter {
     sender: mpsc::Sender<Incoming>,
@@ -160,9 +177,7 @@ impl RpcClient {
             // reader exit must either be rejected here or cleared by it.
             if self.is_closed() {
                 return Box::pin(async move {
-                    Err(HarnessError::Protocol(format!(
-                        "{method}: app-server exited before responding"
-                    )))
+                    Err(HarnessError::Protocol(format!("{method}: {EXITED}")))
                 });
             }
             pending.insert(id, tx);
@@ -171,9 +186,7 @@ impl RpcClient {
         if self.writer.send(line.to_string()).is_err() {
             self.pending.lock().expect("pending lock").remove(&id);
             return Box::pin(async move {
-                Err(HarnessError::Protocol(format!(
-                    "{method}: app-server stdin closed"
-                )))
+                Err(HarnessError::Protocol(format!("{method}: {STDIN_CLOSED}")))
             });
         }
         Box::pin(async move {
@@ -181,9 +194,7 @@ impl RpcClient {
                 Ok(Ok(result)) => Ok(result),
                 Ok(Err(message)) => Err(HarnessError::Protocol(format!("{method}: {message}"))),
                 // Sender dropped: the reader hit EOF and failed all pending.
-                Err(_) => Err(HarnessError::Protocol(format!(
-                    "{method}: app-server exited before responding"
-                ))),
+                Err(_) => Err(HarnessError::Protocol(format!("{method}: {EXITED}"))),
             }
         })
     }
@@ -232,7 +243,7 @@ async fn write_loop(
         };
         if let Err(e) = write.await {
             tracing::debug!(target: "zeron_harness::rpc", "stdin write failed (tolerated): {e}");
-            fail_pending(&pending, &closed, &format!("app-server stdin closed ({e})"));
+            fail_pending(&pending, &closed, &format!("{STDIN_CLOSED} ({e})"));
             return;
         }
     }
@@ -516,9 +527,36 @@ mod tests {
         )
         .await
         .expect("a failed write must fail the request without waiting for EOF");
-        assert!(result.unwrap_err().to_string().contains("stdin closed"));
+        let error = result.unwrap_err();
+        assert!(error.to_string().contains("stdin closed"));
+        assert!(transport_lost(&error), "{error}");
         assert!(client.is_closed());
         assert!(client.pending.lock().unwrap().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_lost_answer_reads_as_transport_lost() {
+        // EOF with the request outstanding.
+        let (_child, client, _incoming) = scripted_child("read line");
+        let error = tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            client.request("thread/start", json!({})),
+        )
+        .await
+        .expect("EOF fails the request")
+        .unwrap_err();
+        assert!(transport_lost(&error), "{error}");
+        // And once closed, a request is turned away the same way.
+        let error = client.request("turn/start", json!({})).await.unwrap_err();
+        assert!(transport_lost(&error), "{error}");
+        for refused in [
+            HarnessError::Protocol("thread/start: bad request (code -32600)".into()),
+            HarnessError::Protocol(EXITED.into()),
+            HarnessError::Io(std::io::Error::other(EXITED)),
+        ] {
+            assert!(!transport_lost(&refused), "{refused}");
+        }
     }
 
     #[test]
