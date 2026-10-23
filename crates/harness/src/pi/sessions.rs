@@ -319,8 +319,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("session with spaces.jsonl");
         std::fs::write(&path, "{\"type\":\"session\",\"id\":\"old-id\"}\n").unwrap();
-        // Windows expands short names and adds a verbatim prefix on canonicalization.
-        let expected = path.canonicalize().unwrap();
+        // Windows expands short names on canonicalization; the resolved path
+        // is its plain form, without the verbatim prefix (see `canonical`).
+        let expected = canonical(&path).unwrap();
         let mut store = Store::new(Some(dir.path().join("index")), None);
         store.agent = dir.path().join("agent");
         store.legacy = dir.path().join("legacy.json");
