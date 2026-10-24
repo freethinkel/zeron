@@ -101,8 +101,7 @@ pulldown-cmark.workspace = true
 zeron-markdown.workspace = true
 zatex = { workspace = true, features = ["bundled"] }
 html5ever = "0.39"
-alacritty_terminal.workspace = true
-zeron-term.workspace = true
+zeron-term = { workspace = true, features = ["ghostty"] }
 base64 = "0.22"
 tiny-skia = "0.11"
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "gif", "webp", "bmp", "tiff", "ico"] }

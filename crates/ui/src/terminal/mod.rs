@@ -1,4 +1,4 @@
-//! Terminal panel (feature-inventory §1.10): an `alacritty_terminal`-backed
+//! Terminal panel (feature-inventory §1.10): a libghostty-vt-backed
 //! emulator fed by the engine's PTY stream over the generic RPC client.
 //!
 //! - [`emulator`] — pure Term + vte state machine (bytes in, grid out),
@@ -18,4 +18,4 @@ pub(crate) mod dock;
 pub mod panel;
 pub mod sprite;
 pub mod view;
-pub use zeron_term::{emulator, predict};
+pub use zeron_term::{ghostty as emulator, predict};
