@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, Modifiers,
-    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta,
-    SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
+    Action, App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, Modifiers,
+    ModifiersChangedEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels,
+    Render, ScrollDelta, SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
 use zeron_proto::{TerminalEvent, TerminalSession};
@@ -35,6 +35,7 @@ use crate::theme::Theme;
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
 use super::keys::key_bytes;
+use super::links::{self, Link, link_modifier};
 use super::mouse::{self, MouseEncoder};
 use super::view::{
     COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
@@ -47,6 +48,15 @@ pub const TAB_BAR_HEIGHT: f32 = 40.0;
 const SELECTION_SCROLL_TICK_MS: u64 = 24;
 
 actions!(terminal, [ToggleTerminal]);
+
+/// Open a file a terminal link names (`path:line:col`), the way the chat's
+/// own file links open: in its file surface.
+#[derive(Clone, PartialEq, Action)]
+#[action(namespace = terminal, no_json)]
+pub struct OpenFileLink {
+    pub chat: String,
+    pub target: String,
+}
 
 /// Bind the terminal keymap (global): Cmd+J on macOS, Ctrl+J elsewhere.
 pub fn init(cx: &mut App) {
@@ -365,6 +375,11 @@ pub struct TerminalPanel {
     /// The button whose press went to the program: its drags and its release
     /// follow it there, wherever the pointer is let go.
     mouse_report: Option<MouseButton>,
+    /// The pointer over the grid, so a link under it can light up when Cmd
+    /// goes down without a move.
+    pointer: Option<gpui::Point<Pixels>>,
+    /// The link Cmd+hover underlines: its viewport row and cells.
+    hover_link: Option<(usize, std::ops::Range<usize>)>,
     /// One-shot timer rescheduled only while a live selection remains in an
     /// edge zone.
     selection_scroll_task: Option<Task<()>>,
@@ -398,6 +413,8 @@ impl TerminalPanel {
             geometry: None,
             selection_drag: None,
             mouse_report: None,
+            pointer: None,
+            hover_link: None,
             selection_scroll_task: None,
             rail_tab_key: None,
             bar: MenuScrollbarState::default(),
@@ -1092,8 +1109,21 @@ impl TerminalPanel {
     /// Snapshot for the paint element.
     pub fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
         let tab = self.active_tab(cx)?;
+        let mut lines = tab.emulator.lines();
+        if let Some((row, cells)) = &self.hover_link {
+            // Found on an older grid: output or a resize since may have
+            // shortened the row.
+            for cell in lines
+                .get_mut(*row)
+                .and_then(|line| line.get_mut(cells.clone()))
+                .into_iter()
+                .flatten()
+            {
+                cell.underline = true;
+            }
+        }
         Some(GridSnapshot {
-            lines: tab.emulator.lines(),
+            lines,
             cursor: tab.emulator.cursor(),
         })
     }
@@ -1190,6 +1220,14 @@ impl TerminalPanel {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if event.button == MouseButton::Left
+            && link_modifier(&event.modifiers)
+            && let Some((_, _, link)) = self.link_under(event.position, cx)
+        {
+            window.focus(&self.focus_handle, cx);
+            self.open_link(link, window, cx);
+            return;
+        }
         // As in Ghostty: a program that reads the mouse gets every button,
         // and Shift keeps the mouse here for a selection.
         let report = !event.modifiers.shift && self.captures_mouse(cx);
@@ -1274,6 +1312,8 @@ impl TerminalPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.pointer = Some(event.position);
+        self.update_link_hover(link_modifier(&event.modifiers), cx);
         if let Some(button) = self.mouse_report {
             self.report_mouse(
                 mouse::Action::Motion,
@@ -1349,6 +1389,87 @@ impl TerminalPanel {
             self.selection_drag = None;
             self.selection_scroll_task = None;
         }
+    }
+
+    // ---- links ----
+
+    /// The link under a window position: its viewport row, cells and target.
+    /// An OSC 8 hyperlink wins over the text under it.
+    fn link_under(
+        &self,
+        position: gpui::Point<Pixels>,
+        cx: &App,
+    ) -> Option<(usize, std::ops::Range<usize>, Link)> {
+        let geometry = self.geometry?;
+        if !geometry.bounds.contains(&position) {
+            return None;
+        }
+        let hit = cell_at(
+            f32::from(position.x - geometry.origin.x),
+            f32::from(position.y - geometry.origin.y),
+            geometry.cell_w,
+            geometry.line_h,
+            geometry.cols as usize,
+            geometry.rows as usize,
+        );
+        let emulator = &self.active_tab(cx)?.emulator;
+        let osc8 = emulator.hyperlink_at(hit.row, hit.col);
+        if let Some((cells, link)) =
+            osc8.and_then(|(cells, uri)| Some((cells, links::hyperlink(&uri)?)))
+        {
+            return Some((hit.row, cells, link));
+        }
+        let cells = emulator.line(hit.row);
+        let (chars, cols) = links::row_chars(&cells);
+        let at = cols.iter().rposition(|&c| c <= hit.col)?;
+        let (chars, link) = links::link_at(&chars, at)?;
+        Some((hit.row, links::cell_range(&cells, &cols, chars), link))
+    }
+
+    /// Underline the link under the pointer while the link modifier is held.
+    fn update_link_hover(&mut self, held: bool, cx: &mut Context<Self>) {
+        let hover = self
+            .pointer
+            .filter(|_| held)
+            .and_then(|position| self.link_under(position, cx))
+            .map(|(row, cells, _)| (row, cells));
+        if hover != self.hover_link {
+            self.hover_link = hover;
+            cx.notify();
+        }
+    }
+
+    /// URLs go to the browser. Paths resolve against the shell's directory
+    /// (OSC 7) and open in the chat's file surface, as its own file links
+    /// do; a folder on this machine opens in the file manager.
+    fn open_link(&mut self, link: Link, window: &mut Window, cx: &mut Context<Self>) {
+        let (path, line, col) = match link {
+            Link::Url(url) => return cx.open_url(&url),
+            Link::File { path, line, col } => (path, line, col),
+        };
+        let Some(tab) = self.active_tab(cx) else {
+            return;
+        };
+        // A tab with a target device runs its shell on another machine: its
+        // home and folders are not on this disk.
+        let local = tab.target_device_id.is_none();
+        let home = std::env::var_os("HOME")
+            .filter(|_| local)
+            .map(std::path::PathBuf::from);
+        let path = links::resolve(&path, tab.emulator.pwd().as_deref(), home.as_deref());
+        if local
+            && path.is_dir()
+            && let Ok(url) = url::Url::from_file_path(&path)
+        {
+            return cx.open_url(url.as_str());
+        }
+        window.dispatch_action(
+            Box::new(OpenFileLink {
+                chat: self.selected_chat(cx),
+                target: links::file_link_target(&path, line, col),
+            }),
+            cx,
+        );
     }
 
     /// Wheel lines (positive: up) at a window position: to a program that
@@ -1524,6 +1645,10 @@ impl TerminalPanel {
     fn on_terminal_hover(&mut self, hovered: &bool, _window: &mut Window, cx: &mut Context<Self>) {
         if self.bar.set_list_hovered(*hovered) {
             cx.notify();
+        }
+        if !*hovered {
+            self.pointer = None;
+            self.update_link_hover(false, cx);
         }
     }
 
@@ -1970,6 +2095,12 @@ impl Render for TerminalPanel {
                         body
                     })
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
+                    .on_modifiers_changed(cx.listener(
+                        |this, event: &ModifiersChangedEvent, _, cx| {
+                            this.update_link_hover(link_modifier(&event.modifiers), cx)
+                        },
+                    ))
+                    .when(self.hover_link.is_some(), |el| el.cursor_pointer())
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                         let lines = match event.delta {
                             ScrollDelta::Lines(delta) => delta.y,
@@ -2214,6 +2345,86 @@ mod tests {
         panel.read_with(cx, |panel, cx| {
             assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 2);
         });
+    }
+
+    /// Cmd+hover underlines the whole link, OSC 8 first; Cmd+click on a path
+    /// asks the shell to open it, resolved against the shell's directory.
+    #[gpui::test]
+    fn cmd_hover_underlines_a_link_and_cmd_click_opens_it(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, point};
+        use std::{cell::RefCell, rc::Rc};
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let opened = Rc::new(RefCell::new(Vec::new()));
+        cx.update({
+            let opened = opened.clone();
+            move |cx| {
+                cx.on_action(move |action: &OpenFileLink, _| {
+                    opened
+                        .borrow_mut()
+                        .push((action.chat.clone(), action.target.clone()))
+                });
+            }
+        });
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("chat".into());
+                state
+            });
+            let mut panel = TerminalPanel::new(state, cx);
+            let key = panel.reserve_tab_for_chat("chat".into(), "Shell", cx);
+            panel.tab_mut("chat", key).unwrap().emulator.feed(
+                b"\x1b]7;file://host/repo\x07see src/main.rs:12 or \x1b]8;;https://a.b/\x1b\\do\x1b[1mcs\x1b[0m\x1b]8;;\x1b\\",
+            );
+            panel
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let g = panel.read_with(cx, |panel, _| panel.geometry.unwrap());
+        let cell =
+            |col: usize| g.origin + point(px(g.cell_w * (col as f32 + 0.5)), px(g.line_h * 0.5));
+        let link_mods = Modifiers {
+            platform: cfg!(target_os = "macos"),
+            control: !cfg!(target_os = "macos"),
+            ..Modifiers::default()
+        };
+        let hover = |cx: &mut gpui::VisualTestContext, col, modifiers| {
+            cx.simulate_event(MouseMoveEvent {
+                position: cell(col),
+                pressed_button: None,
+                modifiers,
+            });
+            panel.read_with(cx, |panel, cx| {
+                let line = &panel.active_grid_snapshot(cx).unwrap().lines[0];
+                (0..line.len())
+                    .filter(|&c| line[c].underline)
+                    .collect::<Vec<_>>()
+            })
+        };
+        // "see src/main.rs:12 or docs": the path is cells 4..18, the
+        // hyperlink 22..26.
+        assert_eq!(hover(cx, 8, Modifiers::default()), Vec::<usize>::new());
+        assert_eq!(hover(cx, 8, link_mods), (4..18).collect::<Vec<_>>());
+        assert_eq!(hover(cx, 23, link_mods), (22..26).collect::<Vec<_>>());
+        assert_eq!(hover(cx, 1, link_mods), Vec::<usize>::new());
+
+        cx.simulate_event(MouseDownEvent {
+            button: MouseButton::Left,
+            position: cell(8),
+            modifiers: link_mods,
+            click_count: 1,
+            first_mouse: false,
+        });
+        assert_eq!(
+            *opened.borrow(),
+            [(
+                "chat".to_string(),
+                "file:///repo/src/main.rs:12".to_string()
+            )]
+        );
     }
 
     #[test]

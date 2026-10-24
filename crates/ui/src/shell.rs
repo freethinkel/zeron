@@ -13782,6 +13782,13 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &RandomWallpaper, _, cx| {
                 this.random_wallpaper(cx);
             }))
+            // Cmd+click on a path in a terminal opens it like a chat's own
+            // file link.
+            .on_action(cx.listener(
+                |this, action: &crate::terminal::panel::OpenFileLink, window, cx| {
+                    this.open_workspace_file_link(&action.chat, &action.target, window, cx);
+                },
+            ))
             .on_action(cx.listener(
                 |this, action: &crate::pull_request_detail::OpenPullRequest, window, cx| {
                     // From a chat (a sidebar badge, the composer's badge), the

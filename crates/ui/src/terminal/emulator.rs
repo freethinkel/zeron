@@ -217,6 +217,21 @@ impl Emulator {
         self.term.title().ok().filter(|t| !t.is_empty())
     }
 
+    /// The shell's working directory, if it reports one (OSC 7).
+    pub fn pwd(&self) -> Option<std::path::PathBuf> {
+        // Ghostty keeps the report as sent: `file://host/path`
+        // (percent-encoded), kitty's `kitty-shell-cwd://host/path`, or a path.
+        let pwd = self.term.pwd().ok()?;
+        if let Some(rest) = pwd.strip_prefix("file://") {
+            let url = url::Url::parse(&format!("file://{}", &rest[rest.find('/')?..])).ok()?;
+            return url.to_file_path().ok();
+        }
+        let path = pwd
+            .strip_prefix("kitty-shell-cwd://")
+            .map_or(Some(pwd), |rest| rest.find('/').map(|slash| &rest[slash..]))?;
+        path.starts_with('/').then(|| path.into())
+    }
+
     /// True once a BEL arrived; reading clears it.
     pub fn take_bell(&mut self) -> bool {
         std::mem::take(&mut self.bell)
@@ -530,6 +545,40 @@ impl Emulator {
             row,
             col: self.term.cursor_x().ok()? as usize,
         })
+    }
+
+    fn hyperlink(&self, point: GridPoint) -> Option<String> {
+        let grid_ref = self.grid_ref(point)?;
+        let mut buf = vec![0; 512];
+        let len = match grid_ref.hyperlink_uri(&mut buf) {
+            Err(Error::OutOfSpace { required }) => {
+                buf.resize(required, 0);
+                grid_ref.hyperlink_uri(&mut buf).ok()?
+            }
+            other => other.ok()?,
+        };
+        (len > 0).then(|| String::from_utf8_lossy(&buf[..len]).into_owned())
+    }
+
+    /// The OSC 8 hyperlink at a viewport cell: the cells around it on that
+    /// row with the same URI, and the URI.
+    // ponytail: one row, like links in the text; a hyperlink wrapped onto
+    // the next row underlines one row at a time.
+    pub fn hyperlink_at(
+        &self,
+        viewport_row: usize,
+        col: usize,
+    ) -> Option<(std::ops::Range<usize>, String)> {
+        let at = |col| self.grid_point(viewport_row, col);
+        let uri = self.hyperlink(at(col))?;
+        let same = |c: &usize| self.hyperlink(at(*c)).as_ref() == Some(&uri);
+        let start = (0..col).rev().take_while(same).last().unwrap_or(col);
+        let end = (col + 1..self.cols())
+            .take_while(same)
+            .last()
+            .unwrap_or(col)
+            + 1;
+        Some((start..end, uri))
     }
 
     /// Test/diagnostic helper: a viewport row as trimmed text (wide-char
@@ -1052,6 +1101,33 @@ mod tests {
         e.start_selection(SelectionType::Simple, e.grid_point(0, 2), Side::Left);
         assert_eq!(e.selection_text(), None);
         assert!(!e.has_selection());
+    }
+
+    /// An OSC 8 hyperlink spans its cells, whatever their styles.
+    #[test]
+    fn a_hyperlink_spans_its_cells_across_a_style_change() {
+        let mut e = emu(20, 3);
+        e.feed(b"> \x1b]8;;https://a.b/c\x1b\\li\x1b[1mnk\x1b[0m\x1b]8;;\x1b\\ x");
+        assert_eq!(e.row_text(0), "> link x");
+        let link = Some((2..6, "https://a.b/c".to_string()));
+        assert_eq!(e.hyperlink_at(0, 2), link);
+        assert_eq!(e.hyperlink_at(0, 5), link);
+        assert_eq!(e.hyperlink_at(0, 6), None);
+        assert_eq!(e.hyperlink_at(0, 0), None);
+        // Scrolled back, a viewport row names a history row.
+        e.feed(b"\r\n\r\n\r\n");
+        e.scroll(1);
+        assert_eq!(e.hyperlink_at(0, 3), link);
+    }
+
+    #[test]
+    fn the_shell_reports_its_directory() {
+        let mut e = emu(20, 2);
+        assert_eq!(e.pwd(), None);
+        e.feed(b"\x1b]7;file://mac.local/tmp/a%20b\x07");
+        assert_eq!(e.pwd(), Some("/tmp/a b".into()));
+        e.feed(b"\x1b]7;kitty-shell-cwd://mac.local/srv/x y\x07");
+        assert_eq!(e.pwd(), Some("/srv/x y".into()));
     }
 
     #[test]
