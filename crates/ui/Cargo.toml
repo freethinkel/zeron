@@ -11,6 +11,7 @@ project-palette-fixture = []
 # New project's typed path against a real engine, filmed in process.
 project-path-fixture = ["gpui_platform/test-support"]
 compact-picker-fixture = ["gpui_platform/test-support"]
+terminal-fixture = ["gpui_platform/test-support"]
 
 # Native captures explicitly present the freshly drawn scene, including when
 # a nested Wayland compositor has stopped requesting idle frames.
@@ -95,6 +96,10 @@ required-features = ["appshots-fixture"]
 [[example]]
 name = "sidebar-fixture"
 required-features = ["project-palette-fixture"]
+
+[[example]]
+name = "terminal-fixture"
+required-features = ["terminal-fixture"]
 
 [[example]]
 name = "compact-picker-fixture"
