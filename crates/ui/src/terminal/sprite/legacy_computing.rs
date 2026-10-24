@@ -24,8 +24,9 @@ use super::block::{block, block_shade, full_block_shade};
 use super::box_drawing::{self, Lines, Style};
 use super::canvas::{self, Canvas, ON, Rect, pt};
 use super::common::{
-    Alignment, Corner, Edge, FIVE_EIGHTHS, Fraction, HALF, Horizontal, ONE_EIGHTH, ONE_QUARTER, ONE_THIRD, Quads,
-    SEVEN_EIGHTHS, Shade, THREE_EIGHTHS, THREE_QUARTERS, TWO_THIRDS, Thickness, Vertical, fill,
+    Alignment, Corner, Edge, FIVE_EIGHTHS, Fraction, HALF, Horizontal, ONE_EIGHTH, ONE_QUARTER,
+    ONE_THIRD, Quads, SEVEN_EIGHTHS, Shade, THREE_EIGHTHS, THREE_QUARTERS, TWO_THIRDS, Thickness,
+    Vertical, fill,
 };
 use super::geometric_shapes::corner_triangle_shade;
 
@@ -50,7 +51,10 @@ impl SmoothMosaic {
     /// anything else is not. A point between two set corners of the same
     /// edge is dropped (it would lie on a straight line anyway).
     fn from(rows: [&str; 4]) -> SmoothMosaic {
-        let p: Vec<bool> = rows.iter().flat_map(|r| r.bytes().map(|b| b == b'#')).collect();
+        let p: Vec<bool> = rows
+            .iter()
+            .flat_map(|r| r.bytes().map(|b| b == b'#'))
+            .collect();
         debug_assert_eq!(p.len(), 12);
         // Ghostty's index i into "abc\ndef\n…" is row i/4, column i%4.
         let h = |i: usize| p[(i / 4) * 3 + i % 4];
@@ -70,7 +74,13 @@ impl SmoothMosaic {
 }
 
 /// Sextants
-pub fn draw_1fb00_1fb3b(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fb00_1fb3b(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     use Fraction::{Half, One, OneThird, TwoThirds, Zero};
     let idx = cp - 0x1fb00;
     // Bits, low to high: tl, tr, ml, mr, bl, br. The codepoints skip the
@@ -98,54 +108,60 @@ pub fn draw_1fb00_1fb3b(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32,
 }
 
 /// Smooth Mosaics
-pub fn draw_1fb3c_1fb67(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fb3c_1fb67(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     // Hand written lookup table for these shapes since there's no
     // mathematical pattern in the codepoints.
     let rows: [&str; 4] = match cp {
-        0x1fb3c => ["...", "...", "#..", "##."],    // 🬼
-        0x1fb3d => ["...", "...", "#\\.", "###"],   // 🬽
-        0x1fb3e => ["...", "#..", "#\\.", "##."],   // 🬾
-        0x1fb3f => ["...", "#..", "##.", "###"],    // 🬿
-        0x1fb40 => ["#..", "#..", "##.", "##."],    // 🭀
-        0x1fb41 => ["/##", "###", "###", "###"],    // 🭁
-        0x1fb42 => ["./#", "###", "###", "###"],    // 🭂
-        0x1fb43 => [".##", ".##", "###", "###"],    // 🭃
-        0x1fb44 => ["..#", ".##", "###", "###"],    // 🭄
-        0x1fb45 => [".##", ".##", ".##", "###"],    // 🭅
-        0x1fb46 => ["...", "./#", "###", "###"],    // 🭆
-        0x1fb47 => ["...", "...", "..#", ".##"],    // 🭇
-        0x1fb48 => ["...", "...", "./#", "###"],    // 🭈
-        0x1fb49 => ["...", "..#", "./#", ".##"],    // 🭉
-        0x1fb4a => ["...", "..#", ".##", "###"],    // 🭊
-        0x1fb4b => ["..#", "..#", ".##", ".##"],    // 🭋
-        0x1fb4c => ["##\\", "###", "###", "###"],   // 🭌
-        0x1fb4d => ["#\\.", "###", "###", "###"],   // 🭍
-        0x1fb4e => ["##.", "##.", "###", "###"],    // 🭎
-        0x1fb4f => ["#..", "##.", "###", "###"],    // 🭏
-        0x1fb50 => ["##.", "##.", "##.", "###"],    // 🭐
-        0x1fb51 => ["...", "#\\.", "###", "###"],   // 🭑
-        0x1fb52 => ["###", "###", "###", "\\##"],   // 🭒
-        0x1fb53 => ["###", "###", "###", ".\\#"],   // 🭓
-        0x1fb54 => ["###", "###", ".##", ".##"],    // 🭔
-        0x1fb55 => ["###", "###", ".##", "..#"],    // 🭕
-        0x1fb56 => ["###", ".##", ".##", ".##"],    // 🭖
-        0x1fb57 => ["##.", "#..", "...", "..."],    // 🭗
-        0x1fb58 => ["###", "#/.", "...", "..."],    // 🭘
-        0x1fb59 => ["##.", "#/.", "#..", "..."],    // 🭙
-        0x1fb5a => ["###", "##.", "#..", "..."],    // 🭚
-        0x1fb5b => ["##.", "##.", "#..", "#.."],    // 🭛
-        0x1fb5c => ["###", "###", "#/.", "..."],    // 🭜
-        0x1fb5d => ["###", "###", "###", "##/"],    // 🭝
-        0x1fb5e => ["###", "###", "###", "#/."],    // 🭞
-        0x1fb5f => ["###", "###", "##.", "##."],    // 🭟
-        0x1fb60 => ["###", "###", "##.", "#.."],    // 🭠
-        0x1fb61 => ["###", "##.", "##.", "##."],    // 🭡
-        0x1fb62 => [".##", "..#", "...", "..."],    // 🭢
-        0x1fb63 => ["###", ".\\#", "...", "..."],   // 🭣
-        0x1fb64 => [".##", ".\\#", "..#", "..."],   // 🭤
-        0x1fb65 => ["###", ".##", "..#", "..."],    // 🭥
-        0x1fb66 => [".##", ".##", "..#", "..#"],    // 🭦
-        0x1fb67 => ["###", "###", ".\\#", "..."],   // 🭧
+        0x1fb3c => ["...", "...", "#..", "##."],  // 🬼
+        0x1fb3d => ["...", "...", "#\\.", "###"], // 🬽
+        0x1fb3e => ["...", "#..", "#\\.", "##."], // 🬾
+        0x1fb3f => ["...", "#..", "##.", "###"],  // 🬿
+        0x1fb40 => ["#..", "#..", "##.", "##."],  // 🭀
+        0x1fb41 => ["/##", "###", "###", "###"],  // 🭁
+        0x1fb42 => ["./#", "###", "###", "###"],  // 🭂
+        0x1fb43 => [".##", ".##", "###", "###"],  // 🭃
+        0x1fb44 => ["..#", ".##", "###", "###"],  // 🭄
+        0x1fb45 => [".##", ".##", ".##", "###"],  // 🭅
+        0x1fb46 => ["...", "./#", "###", "###"],  // 🭆
+        0x1fb47 => ["...", "...", "..#", ".##"],  // 🭇
+        0x1fb48 => ["...", "...", "./#", "###"],  // 🭈
+        0x1fb49 => ["...", "..#", "./#", ".##"],  // 🭉
+        0x1fb4a => ["...", "..#", ".##", "###"],  // 🭊
+        0x1fb4b => ["..#", "..#", ".##", ".##"],  // 🭋
+        0x1fb4c => ["##\\", "###", "###", "###"], // 🭌
+        0x1fb4d => ["#\\.", "###", "###", "###"], // 🭍
+        0x1fb4e => ["##.", "##.", "###", "###"],  // 🭎
+        0x1fb4f => ["#..", "##.", "###", "###"],  // 🭏
+        0x1fb50 => ["##.", "##.", "##.", "###"],  // 🭐
+        0x1fb51 => ["...", "#\\.", "###", "###"], // 🭑
+        0x1fb52 => ["###", "###", "###", "\\##"], // 🭒
+        0x1fb53 => ["###", "###", "###", ".\\#"], // 🭓
+        0x1fb54 => ["###", "###", ".##", ".##"],  // 🭔
+        0x1fb55 => ["###", "###", ".##", "..#"],  // 🭕
+        0x1fb56 => ["###", ".##", ".##", ".##"],  // 🭖
+        0x1fb57 => ["##.", "#..", "...", "..."],  // 🭗
+        0x1fb58 => ["###", "#/.", "...", "..."],  // 🭘
+        0x1fb59 => ["##.", "#/.", "#..", "..."],  // 🭙
+        0x1fb5a => ["###", "##.", "#..", "..."],  // 🭚
+        0x1fb5b => ["##.", "##.", "#..", "#.."],  // 🭛
+        0x1fb5c => ["###", "###", "#/.", "..."],  // 🭜
+        0x1fb5d => ["###", "###", "###", "##/"],  // 🭝
+        0x1fb5e => ["###", "###", "###", "#/."],  // 🭞
+        0x1fb5f => ["###", "###", "##.", "##."],  // 🭟
+        0x1fb60 => ["###", "###", "##.", "#.."],  // 🭠
+        0x1fb61 => ["###", "##.", "##.", "##."],  // 🭡
+        0x1fb62 => [".##", "..#", "...", "..."],  // 🭢
+        0x1fb63 => ["###", ".\\#", "...", "..."], // 🭣
+        0x1fb64 => [".##", ".\\#", "..#", "..."], // 🭤
+        0x1fb65 => ["###", ".##", "..#", "..."],  // 🭥
+        0x1fb66 => [".##", ".##", "..#", "..#"],  // 🭦
+        0x1fb67 => ["###", "###", ".\\#", "..."], // 🭧
         _ => return,
     };
     let mosaic = SmoothMosaic::from(rows);
@@ -172,7 +188,11 @@ pub fn draw_1fb3c_1fb67(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32,
     ];
     // z2d starts the path at the first lineTo; tiny-skia needs a moveTo.
     let mut pb = PathBuilder::new();
-    for (x, y) in points.iter().filter(|p| p.0).map(|p| (p.1 as f32, p.2 as f32)) {
+    for (x, y) in points
+        .iter()
+        .filter(|p| p.0)
+        .map(|p| (p.1 as f32, p.2 as f32))
+    {
         if pb.is_empty() {
             pb.move_to(x, y);
         } else {
@@ -185,7 +205,13 @@ pub fn draw_1fb3c_1fb67(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32,
     }
 }
 
-pub fn draw_1fb68_1fb6f(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fb68_1fb6f(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     let (edge, inverted) = match cp {
         0x1fb68 => (Edge::Left, true),    // 🭨
         0x1fb69 => (Edge::Top, true),     // 🭩
@@ -205,15 +231,41 @@ pub fn draw_1fb68_1fb6f(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32,
 }
 
 /// Vertical one eighth blocks
-pub fn draw_1fb70_1fb75(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fb70_1fb75(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     let n = (cp + 1 - 0x1fb70) as usize;
-    fill(metrics, canvas, Fraction::EIGHTHS[n], Fraction::EIGHTHS[n + 1], Fraction::Zero, Fraction::One);
+    fill(
+        metrics,
+        canvas,
+        Fraction::EIGHTHS[n],
+        Fraction::EIGHTHS[n + 1],
+        Fraction::Zero,
+        Fraction::One,
+    );
 }
 
 /// Horizontal one eighth blocks
-pub fn draw_1fb76_1fb7b(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fb76_1fb7b(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     let n = (cp + 1 - 0x1fb76) as usize;
-    fill(metrics, canvas, Fraction::Zero, Fraction::One, Fraction::EIGHTHS[n], Fraction::EIGHTHS[n + 1]);
+    fill(
+        metrics,
+        canvas,
+        Fraction::Zero,
+        Fraction::One,
+        Fraction::EIGHTHS[n],
+        Fraction::EIGHTHS[n + 1],
+    );
 }
 
 pub fn draw_1fb7c_1fb97(cp: u32, canvas: &mut Canvas, width: u32, height: u32, metrics: &Metrics) {
@@ -309,7 +361,13 @@ pub fn draw_1fb7c_1fb97(cp: u32, canvas: &mut Canvas, width: u32, height: u32, m
         0x1fb96 => checkerboard_fill(m, canvas, 1),
         // '🮗'
         0x1fb97 => {
-            canvas.box_(0, (height / 4) as i32, width as i32, (2 * height / 4) as i32, ON);
+            canvas.box_(
+                0,
+                (height / 4) as i32,
+                width as i32,
+                (2 * height / 4) as i32,
+                ON,
+            );
             canvas.box_(0, (3 * height / 4) as i32, width as i32, height as i32, ON);
         }
         _ => {}
@@ -345,12 +403,22 @@ fn diagonal_fill(metrics: &Metrics, canvas: &mut Canvas, upper_right: bool) {
         let i = i as i32 - line_count as i32;
         let near_x = i as f64 * stride;
         let far_x = float_width + near_x;
-        let (top_x, bottom_x) = if upper_right { (far_x, near_x) } else { (near_x, far_x) };
+        let (top_x, bottom_x) = if upper_right {
+            (far_x, near_x)
+        } else {
+            (near_x, far_x)
+        };
         canvas.line(pt(top_x, 0.0), pt(bottom_x, float_height), float_thick, ON);
     }
 }
 
-pub fn draw_1fb9a_1fb9f(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fb9a_1fb9f(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     match cp {
         // '🮚'
         0x1fb9a => {
@@ -374,7 +442,13 @@ pub fn draw_1fb9a_1fb9f(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32,
     }
 }
 
-pub fn draw_1fba0_1fbae(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fba0_1fbae(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     let q = |tl, tr, bl, br| Quads { tl, tr, bl, br };
     let corners = match cp {
         0x1fba0 => q(true, false, false, false), // 🮠
@@ -402,7 +476,12 @@ pub fn draw_1fbaf(_cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metr
     box_drawing::lines_char(
         metrics,
         canvas,
-        Lines { up: Style::Heavy, down: Style::Heavy, left: Style::Light, right: Style::Light },
+        Lines {
+            up: Style::Heavy,
+            down: Style::Heavy,
+            left: Style::Light,
+            right: Style::Light,
+        },
     );
 }
 
@@ -415,14 +494,30 @@ pub fn draw_1fbbd(_cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metr
 
 /// 🮾
 pub fn draw_1fbbe(_cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
-    corner_diagonal_lines(metrics, canvas, Quads { br: true, ..Quads::default() });
+    corner_diagonal_lines(
+        metrics,
+        canvas,
+        Quads {
+            br: true,
+            ..Quads::default()
+        },
+    );
     canvas.invert();
     clip_to_cell(canvas);
 }
 
 /// 🮿
 pub fn draw_1fbbf(_cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
-    corner_diagonal_lines(metrics, canvas, Quads { tl: true, tr: true, bl: true, br: true });
+    corner_diagonal_lines(
+        metrics,
+        canvas,
+        Quads {
+            tl: true,
+            tr: true,
+            bl: true,
+            br: true,
+        },
+    );
     canvas.invert();
     clip_to_cell(canvas);
 }
@@ -438,7 +533,13 @@ pub fn draw_1fbcf(_cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metr
 }
 
 /// Cell diagonals.
-pub fn draw_1fbd0_1fbdf(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fbd0_1fbdf(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     use Alignment as A;
     let m = metrics;
     match cp {
@@ -494,26 +595,32 @@ pub fn draw_1fbd0_1fbdf(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32,
     }
 }
 
-pub fn draw_1fbe0_1fbef(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
+pub fn draw_1fbe0_1fbef(
+    cp: u32,
+    canvas: &mut Canvas,
+    _width: u32,
+    _height: u32,
+    metrics: &Metrics,
+) {
     use Alignment as A;
     let m = metrics;
     match cp {
-        0x1fbe0 => circle(m, canvas, A::UPPER, false),             // 🯠
-        0x1fbe1 => circle(m, canvas, A::RIGHT, false),             // 🯡
-        0x1fbe2 => circle(m, canvas, A::LOWER, false),             // 🯢
-        0x1fbe3 => circle(m, canvas, A::LEFT, false),              // 🯣
-        0x1fbe4 => block(m, canvas, A::UPPER, 0.5, 0.5),           // 🯤
-        0x1fbe5 => block(m, canvas, A::LOWER, 0.5, 0.5),           // 🯥
-        0x1fbe6 => block(m, canvas, A::LEFT, 0.5, 0.5),            // 🯦
-        0x1fbe7 => block(m, canvas, A::RIGHT, 0.5, 0.5),           // 🯧
-        0x1fbe8 => circle(m, canvas, A::UPPER, true),              // 🯨
-        0x1fbe9 => circle(m, canvas, A::RIGHT, true),              // 🯩
-        0x1fbea => circle(m, canvas, A::LOWER, true),              // 🯪
-        0x1fbeb => circle(m, canvas, A::LEFT, true),               // 🯫
-        0x1fbec => circle(m, canvas, A::UPPER_RIGHT, true),        // 🯬
-        0x1fbed => circle(m, canvas, A::LOWER_LEFT, true),         // 🯭
-        0x1fbee => circle(m, canvas, A::LOWER_RIGHT, true),        // 🯮
-        0x1fbef => circle(m, canvas, A::UPPER_LEFT, true),         // 🯯
+        0x1fbe0 => circle(m, canvas, A::UPPER, false),   // 🯠
+        0x1fbe1 => circle(m, canvas, A::RIGHT, false),   // 🯡
+        0x1fbe2 => circle(m, canvas, A::LOWER, false),   // 🯢
+        0x1fbe3 => circle(m, canvas, A::LEFT, false),    // 🯣
+        0x1fbe4 => block(m, canvas, A::UPPER, 0.5, 0.5), // 🯤
+        0x1fbe5 => block(m, canvas, A::LOWER, 0.5, 0.5), // 🯥
+        0x1fbe6 => block(m, canvas, A::LEFT, 0.5, 0.5),  // 🯦
+        0x1fbe7 => block(m, canvas, A::RIGHT, 0.5, 0.5), // 🯧
+        0x1fbe8 => circle(m, canvas, A::UPPER, true),    // 🯨
+        0x1fbe9 => circle(m, canvas, A::RIGHT, true),    // 🯩
+        0x1fbea => circle(m, canvas, A::LOWER, true),    // 🯪
+        0x1fbeb => circle(m, canvas, A::LEFT, true),     // 🯫
+        0x1fbec => circle(m, canvas, A::UPPER_RIGHT, true), // 🯬
+        0x1fbed => circle(m, canvas, A::LOWER_LEFT, true), // 🯭
+        0x1fbee => circle(m, canvas, A::LOWER_RIGHT, true), // 🯮
+        0x1fbef => circle(m, canvas, A::UPPER_LEFT, true), // 🯯
         _ => {}
     }
 }
@@ -559,13 +666,28 @@ fn corner_diagonal_lines(metrics: &Metrics, canvas: &mut Canvas, corners: Quads)
         canvas.line(pt(center_x, 0.0), pt(0.0, center_y), float_thick, ON);
     }
     if corners.tr {
-        canvas.line(pt(center_x, 0.0), pt(float_width, center_y), float_thick, ON);
+        canvas.line(
+            pt(center_x, 0.0),
+            pt(float_width, center_y),
+            float_thick,
+            ON,
+        );
     }
     if corners.bl {
-        canvas.line(pt(center_x, float_height), pt(0.0, center_y), float_thick, ON);
+        canvas.line(
+            pt(center_x, float_height),
+            pt(0.0, center_y),
+            float_thick,
+            ON,
+        );
     }
     if corners.br {
-        canvas.line(pt(center_x, float_height), pt(float_width, center_y), float_thick, ON);
+        canvas.line(
+            pt(center_x, float_height),
+            pt(float_width, center_y),
+            float_thick,
+            ON,
+        );
     }
 }
 
@@ -589,7 +711,12 @@ fn anchor(metrics: &Metrics, a: Alignment) -> (f64, f64) {
 fn cell_diagonal(metrics: &Metrics, canvas: &mut Canvas, from: Alignment, to: Alignment) {
     let (x0, y0) = anchor(metrics, from);
     let (x1, y1) = anchor(metrics, to);
-    canvas.line(pt(x0, y0), pt(x1, y1), Thickness::Light.height(metrics.box_thickness) as f64, ON);
+    canvas.line(
+        pt(x0, y0),
+        pt(x1, y1),
+        Thickness::Light.height(metrics.box_thickness) as f64,
+        ON,
+    );
 }
 
 fn checkerboard_fill(metrics: &Metrics, canvas: &mut Canvas, parity: u32) {

@@ -7,8 +7,8 @@
 use super::Metrics;
 use super::canvas::{Canvas, Rect};
 use super::common::{
-    Alignment, FIVE_EIGHTHS, Fraction, HALF, Horizontal, ONE_EIGHTH, ONE_QUARTER, Quads, SEVEN_EIGHTHS, Shade,
-    THREE_EIGHTHS, THREE_QUARTERS, Vertical, fill,
+    Alignment, FIVE_EIGHTHS, Fraction, HALF, Horizontal, ONE_EIGHTH, ONE_QUARTER, Quads,
+    SEVEN_EIGHTHS, Shade, THREE_EIGHTHS, THREE_QUARTERS, Vertical, fill,
 };
 
 pub fn draw_2580_259f(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, metrics: &Metrics) {
@@ -51,7 +51,13 @@ pub fn draw_2580_259f(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, m
     }
 }
 
-pub fn block(metrics: &Metrics, canvas: &mut Canvas, alignment: Alignment, width: f64, height: f64) {
+pub fn block(
+    metrics: &Metrics,
+    canvas: &mut Canvas,
+    alignment: Alignment,
+    width: f64,
+    height: f64,
+) {
     block_shade(metrics, canvas, alignment, width, height, Shade::On);
 }
 
@@ -75,11 +81,25 @@ pub fn block_shade(
         Vertical::Bottom => metrics.cell_height - h,
         Vertical::Middle => (metrics.cell_height - h) / 2,
     };
-    canvas.rect(Rect { x: x as i32, y: y as i32, width: w as i32, height: h as i32 }, shade.into());
+    canvas.rect(
+        Rect {
+            x: x as i32,
+            y: y as i32,
+            width: w as i32,
+            height: h as i32,
+        },
+        shade.into(),
+    );
 }
 
 pub fn full_block_shade(metrics: &Metrics, canvas: &mut Canvas, shade: Shade) {
-    canvas.box_(0, 0, metrics.cell_width as i32, metrics.cell_height as i32, shade.into());
+    canvas.box_(
+        0,
+        0,
+        metrics.cell_width as i32,
+        metrics.cell_height as i32,
+        shade.into(),
+    );
 }
 
 fn quadrant(metrics: &Metrics, canvas: &mut Canvas, quads: Quads) {

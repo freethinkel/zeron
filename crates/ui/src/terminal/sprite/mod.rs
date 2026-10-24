@@ -63,17 +63,45 @@ const RANGES: &[(u32, u32, DrawFn)] = &[
     (0xE0D2, 0xE0D2, powerline::draw_e0d2),
     (0xE0D4, 0xE0D4, powerline::draw_e0d4),
     (0xF5D0, 0xF60D, branch::draw_f5d0_f60d),
-    (0x1CC1B, 0x1CC1E, legacy_computing_supplement::draw_1cc1b_1cc1e),
-    (0x1CC21, 0x1CC2F, legacy_computing_supplement::draw_1cc21_1cc2f),
-    (0x1CC30, 0x1CC3F, legacy_computing_supplement::draw_1cc30_1cc3f),
-    (0x1CD00, 0x1CDE5, legacy_computing_supplement::draw_1cd00_1cde5),
+    (
+        0x1CC1B,
+        0x1CC1E,
+        legacy_computing_supplement::draw_1cc1b_1cc1e,
+    ),
+    (
+        0x1CC21,
+        0x1CC2F,
+        legacy_computing_supplement::draw_1cc21_1cc2f,
+    ),
+    (
+        0x1CC30,
+        0x1CC3F,
+        legacy_computing_supplement::draw_1cc30_1cc3f,
+    ),
+    (
+        0x1CD00,
+        0x1CDE5,
+        legacy_computing_supplement::draw_1cd00_1cde5,
+    ),
     (0x1CE00, 0x1CE00, legacy_computing_supplement::draw_1ce00),
     (0x1CE01, 0x1CE01, legacy_computing_supplement::draw_1ce01),
     (0x1CE0B, 0x1CE0B, legacy_computing_supplement::draw_1ce0b),
     (0x1CE0C, 0x1CE0C, legacy_computing_supplement::draw_1ce0c),
-    (0x1CE16, 0x1CE19, legacy_computing_supplement::draw_1ce16_1ce19),
-    (0x1CE51, 0x1CE8F, legacy_computing_supplement::draw_1ce51_1ce8f),
-    (0x1CE90, 0x1CEAF, legacy_computing_supplement::draw_1ce90_1ceaf),
+    (
+        0x1CE16,
+        0x1CE19,
+        legacy_computing_supplement::draw_1ce16_1ce19,
+    ),
+    (
+        0x1CE51,
+        0x1CE8F,
+        legacy_computing_supplement::draw_1ce51_1ce8f,
+    ),
+    (
+        0x1CE90,
+        0x1CEAF,
+        legacy_computing_supplement::draw_1ce90_1ceaf,
+    ),
     (0x1FB00, 0x1FB3B, legacy_computing::draw_1fb00_1fb3b),
     (0x1FB3C, 0x1FB67, legacy_computing::draw_1fb3c_1fb67),
     (0x1FB68, 0x1FB6F, legacy_computing::draw_1fb68_1fb6f),
@@ -96,7 +124,10 @@ const RANGES: &[(u32, u32, DrawFn)] = &[
 
 fn draw_fn(cp: u32) -> Option<DrawFn> {
     let ix = RANGES.partition_point(|&(_, max, _)| max < cp);
-    RANGES.get(ix).filter(|&&(min, _, _)| min <= cp).map(|&(_, _, f)| f)
+    RANGES
+        .get(ix)
+        .filter(|&&(min, _, _)| min <= cp)
+        .map(|&(_, _, f)| f)
 }
 
 /// Whether `ch` is drawn here rather than by the font.
@@ -122,7 +153,13 @@ pub fn render(ch: char, width: u32, height: u32, metrics: &Metrics) -> Option<Sp
     let mut canvas = Canvas::new(width, height, padding_x, padding_y);
     draw(ch as u32, &mut canvas, width, height, metrics);
     let (w, h) = (canvas.surface_width(), canvas.surface_height());
-    Some(Sprite { width: w, height: h, padding_x, padding_y, alpha: canvas.into_alpha() })
+    Some(Sprite {
+        width: w,
+        height: h,
+        padding_x,
+        padding_y,
+        alpha: canvas.into_alpha(),
+    })
 }
 
 #[cfg(test)]
@@ -141,16 +178,28 @@ mod tests {
     fn sprites_match_ghostty_reference() {
         let filter = std::env::var("SPRITE_RANGE").ok().map(|r| {
             let (a, b) = r.split_once('-').unwrap_or((&r, &r));
-            (u32::from_str_radix(a, 16).unwrap(), u32::from_str_radix(b, 16).unwrap())
+            (
+                u32::from_str_radix(a, 16).unwrap(),
+                u32::from_str_radix(b, 16).unwrap(),
+            )
         });
         let dump = std::env::var("SPRITE_DUMP").ok();
         // (width, ascent, descent, thickness), as in Ghostty.
-        let sets = [(18u32, 30u32, 6u32, 4u32), (12, 20, 4, 3), (11, 19, 2, 2), (9, 15, 2, 1)];
+        let sets = [
+            (18u32, 30u32, 6u32, 4u32),
+            (12, 20, 4, 3),
+            (11, 19, 2, 2),
+            (9, 15, 2, 1),
+        ];
         let mut failures: BTreeMap<u32, Vec<String>> = BTreeMap::new();
 
         for (width, ascent, descent, thickness) in sets {
             let height = ascent + descent;
-            let metrics = Metrics { cell_width: width, cell_height: height, box_thickness: thickness };
+            let metrics = Metrics {
+                cell_width: width,
+                cell_height: height,
+                box_thickness: thickness,
+            };
             let (pad_x, pad_y) = (width / 4, height / 4);
             let (stride_x, stride_y) = (width + 2 * pad_x, height + 2 * pad_y);
 
@@ -158,31 +207,55 @@ mod tests {
             for &(min, max, _) in RANGES {
                 for cp in min..=max {
                     let base = cp & !0xFF;
-                    let sheet = sheets.entry(base).or_insert_with(|| vec![0; (stride_x * 16 * stride_y * 16) as usize]);
-                    let sprite = render(char::from_u32(cp).unwrap(), width, height, &metrics).unwrap();
+                    let sheet = sheets
+                        .entry(base)
+                        .or_insert_with(|| vec![0; (stride_x * 16 * stride_y * 16) as usize]);
+                    let sprite =
+                        render(char::from_u32(cp).unwrap(), width, height, &metrics).unwrap();
                     let (ox, oy) = (stride_x * ((cp - base) % 16), stride_y * ((cp - base) / 16));
                     for y in 0..stride_y {
                         for x in 0..stride_x {
-                            sheet[((oy + y) * stride_x * 16 + ox + x) as usize] = sprite.alpha[(y * stride_x + x) as usize];
+                            sheet[((oy + y) * stride_x * 16 + ox + x) as usize] =
+                                sprite.alpha[(y * stride_x + x) as usize];
                         }
                     }
                 }
             }
 
             for (base, ours) in sheets {
-                let name = format!("U+{:X}...U+{:X}-{}x{}+{}.png", base, base + 0xFF, width, height, thickness);
-                let path = format!("{}/src/terminal/sprite/testdata/{name}", env!("CARGO_MANIFEST_DIR"));
-                let reference = tiny_skia::Pixmap::load_png(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
+                let name = format!(
+                    "U+{:X}...U+{:X}-{}x{}+{}.png",
+                    base,
+                    base + 0xFF,
+                    width,
+                    height,
+                    thickness
+                );
+                let path = format!(
+                    "{}/src/terminal/sprite/testdata/{name}",
+                    env!("CARGO_MANIFEST_DIR")
+                );
+                let reference =
+                    tiny_skia::Pixmap::load_png(&path).unwrap_or_else(|e| panic!("{path}: {e}"));
                 let sheet_w = stride_x * 16;
-                assert_eq!((reference.width(), reference.height()), (sheet_w, stride_y * 16), "{name}");
-                let theirs: Vec<u8> = reference.pixels().iter().map(|p| p.demultiply().red()).collect();
+                assert_eq!(
+                    (reference.width(), reference.height()),
+                    (sheet_w, stride_y * 16),
+                    "{name}"
+                );
+                let theirs: Vec<u8> = reference
+                    .pixels()
+                    .iter()
+                    .map(|p| p.demultiply().red())
+                    .collect();
 
                 for &(min, max, _) in RANGES {
                     for cp in (min..=max).filter(|cp| cp & !0xFF == base) {
                         if filter.is_some_and(|(a, b)| cp < a || cp > b) {
                             continue;
                         }
-                        let (ox, oy) = (stride_x * ((cp - base) % 16), stride_y * ((cp - base) / 16));
+                        let (ox, oy) =
+                            (stride_x * ((cp - base) % 16), stride_y * ((cp - base) / 16));
                         let mut bad = 0;
                         for y in oy..oy + stride_y {
                             for x in ox..ox + stride_x {
@@ -194,7 +267,10 @@ mod tests {
                         }
                         // ponytail: a few edge pixels may round the other way under different AA.
                         if bad > 2 {
-                            failures.entry(cp).or_default().push(format!("{width}x{height}+{thickness}: {bad}px"));
+                            failures
+                                .entry(cp)
+                                .or_default()
+                                .push(format!("{width}x{height}+{thickness}: {bad}px"));
                         }
                     }
                 }
@@ -203,10 +279,12 @@ mod tests {
                     let mut out = tiny_skia::Pixmap::new(sheet_w, stride_y * 16).unwrap();
                     let mut diff = tiny_skia::Pixmap::new(sheet_w, stride_y * 16).unwrap();
                     for (i, (o, t)) in ours.iter().zip(&theirs).enumerate() {
-                        out.pixels_mut()[i] = tiny_skia::PremultipliedColorU8::from_rgba(*o, *o, *o, 255).unwrap();
+                        out.pixels_mut()[i] =
+                            tiny_skia::PremultipliedColorU8::from_rgba(*o, *o, *o, 255).unwrap();
                         let g = (*o.min(t)) / 3;
                         let (r, gr) = if o == t { (g, g) } else { (*t, *o) };
-                        diff.pixels_mut()[i] = tiny_skia::PremultipliedColorU8::from_rgba(r, gr, g, 255).unwrap();
+                        diff.pixels_mut()[i] =
+                            tiny_skia::PremultipliedColorU8::from_rgba(r, gr, g, 255).unwrap();
                     }
                     out.save_png(format!("{dir}/ours-{name}")).unwrap();
                     diff.save_png(format!("{dir}/diff-{name}")).unwrap();
@@ -214,8 +292,21 @@ mod tests {
             }
         }
 
-        let report: Vec<String> =
-            failures.iter().map(|(cp, sizes)| format!("U+{cp:X} {}: {}", char::from_u32(*cp).unwrap(), sizes.join(", "))).collect();
-        assert!(report.is_empty(), "{} glyphs differ from Ghostty:\n{}", report.len(), report.join("\n"));
+        let report: Vec<String> = failures
+            .iter()
+            .map(|(cp, sizes)| {
+                format!(
+                    "U+{cp:X} {}: {}",
+                    char::from_u32(*cp).unwrap(),
+                    sizes.join(", ")
+                )
+            })
+            .collect();
+        assert!(
+            report.is_empty(),
+            "{} glyphs differ from Ghostty:\n{}",
+            report.len(),
+            report.join("\n")
+        );
     }
 }
