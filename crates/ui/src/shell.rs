@@ -11800,7 +11800,9 @@ impl Shell {
                     })
                     .child(self.render_terminal_container(terminal_geometry, window, cx))
             })
-            .child(Self::attachment_drop_overlay(theme))
+            // The terminal dock takes its own drops (the paths, pasted), so
+            // the hint stops above it.
+            .child(Self::attachment_drop_overlay(theme).bottom(px(term_h)))
             .child(Self::mention_drop_overlay(theme))
             .into_any_element()
     }
@@ -13782,6 +13784,13 @@ impl Render for Shell {
             .on_action(cx.listener(|this, _: &RandomWallpaper, _, cx| {
                 this.random_wallpaper(cx);
             }))
+            // Cmd+click on a path in a terminal opens it like a chat's own
+            // file link.
+            .on_action(cx.listener(
+                |this, action: &crate::terminal::panel::OpenFileLink, window, cx| {
+                    this.open_workspace_file_link(&action.chat, &action.target, window, cx);
+                },
+            ))
             .on_action(cx.listener(
                 |this, action: &crate::pull_request_detail::OpenPullRequest, window, cx| {
                     // From a chat (a sidebar badge, the composer's badge), the
