@@ -1,8 +1,8 @@
 //! Terminal paint + input encoding.
 //!
 //! - theme-owned background/ANSI16 plus the xterm 256-color cube/grayscale;
-//! - keystroke → PTY byte encoding (printables, control keys, arrows/nav
-//!   escape sequences, Ctrl- combos, Alt prefixing);
+//! - keystroke routing: typed text through the platform text input, other
+//!   keys through Ghostty's encoder ([`super::keys`]);
 //! - the ordered input queue and the 80 ms resize debounce constant (the
 //!   panel drives the writes and timers; the buffer logic here is pure);
 //! - [`TerminalElement`] — a custom gpui element that measures cell metrics
@@ -18,7 +18,8 @@ use gpui::{
 
 use crate::theme::{Appearance, Theme, rgb_to_hsl};
 
-use super::emulator::{CellColor, CellSnapshot, CursorShape, Side};
+use super::emulator::{CellColor, CellSnapshot, CursorShape, Emulator, Side};
+use super::keys;
 use super::panel::TerminalPanel;
 
 /// Default terminal font metrics; the rendered values come from the theme.
@@ -192,94 +193,6 @@ pub fn cell_at(x: f32, y: f32, cell_w: f32, line_h: f32, cols: usize, rows: usiz
 // Keyboard → bytes
 // ---------------------------------------------------------------------------
 
-/// Encode a keystroke as PTY bytes. `None` means "not ours" — the event should
-/// fall through (e.g. the platform-primary shortcuts that drive app actions).
-///
-/// `app_cursor` switches arrows/home/end from CSI to SS3 per DECCKM.
-pub fn keystroke_bytes(
-    key: &str,
-    key_char: Option<&str>,
-    mods: &Modifiers,
-    app_cursor: bool,
-) -> Option<Vec<u8>> {
-    // Platform-primary combos (Cmd on macOS, the super key elsewhere) belong to
-    // the app keymap, never the PTY.
-    if mods.platform {
-        return None;
-    }
-    if mods.alt {
-        // ESC-prefix the same keystroke without alt.
-        let inner = keystroke_bytes(
-            key,
-            key_char,
-            &Modifiers {
-                alt: false,
-                ..*mods
-            },
-            app_cursor,
-        )?;
-        let mut out = vec![0x1b];
-        out.extend(inner);
-        return Some(out);
-    }
-    if mods.control {
-        return control_bytes(key);
-    }
-
-    let seq = |csi: &[u8], ss3: &[u8]| {
-        Some(if app_cursor {
-            ss3.to_vec()
-        } else {
-            csi.to_vec()
-        })
-    };
-    match key {
-        "enter" => Some(b"\r".to_vec()),
-        "backspace" => Some(vec![0x7f]),
-        "tab" => Some(if mods.shift {
-            b"\x1b[Z".to_vec()
-        } else {
-            b"\t".to_vec()
-        }),
-        "escape" => Some(vec![0x1b]),
-        "space" => Some(b" ".to_vec()),
-        "up" => seq(b"\x1b[A", b"\x1bOA"),
-        "down" => seq(b"\x1b[B", b"\x1bOB"),
-        "right" => seq(b"\x1b[C", b"\x1bOC"),
-        "left" => seq(b"\x1b[D", b"\x1bOD"),
-        "home" => seq(b"\x1b[H", b"\x1bOH"),
-        "end" => seq(b"\x1b[F", b"\x1bOF"),
-        "insert" => Some(b"\x1b[2~".to_vec()),
-        "delete" => Some(b"\x1b[3~".to_vec()),
-        "pageup" => Some(b"\x1b[5~".to_vec()),
-        "pagedown" => Some(b"\x1b[6~".to_vec()),
-        "f1" => Some(b"\x1bOP".to_vec()),
-        "f2" => Some(b"\x1bOQ".to_vec()),
-        "f3" => Some(b"\x1bOR".to_vec()),
-        "f4" => Some(b"\x1bOS".to_vec()),
-        "f5" => Some(b"\x1b[15~".to_vec()),
-        "f6" => Some(b"\x1b[17~".to_vec()),
-        "f7" => Some(b"\x1b[18~".to_vec()),
-        "f8" => Some(b"\x1b[19~".to_vec()),
-        "f9" => Some(b"\x1b[20~".to_vec()),
-        "f10" => Some(b"\x1b[21~".to_vec()),
-        "f11" => Some(b"\x1b[23~".to_vec()),
-        "f12" => Some(b"\x1b[24~".to_vec()),
-        _ => {
-            // Printable: prefer the typed character (IME/shift-aware).
-            let text = key_char.filter(|c| !c.is_empty()).or({
-                // Fall back to single-char key names ("a", "/", …).
-                if key.chars().count() == 1 {
-                    Some(key)
-                } else {
-                    None
-                }
-            })?;
-            Some(text.as_bytes().to_vec())
-        }
-    }
-}
-
 /// How a keydown reaches the PTY.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyRoute {
@@ -293,7 +206,9 @@ pub enum KeyRoute {
 }
 
 /// Route a keydown. Printable text goes through the platform text input;
-/// named keys and modified keys are encoded here.
+/// named keys and modified keys are encoded by Ghostty's key encoder against
+/// `emulator`'s modes (cursor keys, modifyOtherKeys, the kitty keyboard
+/// protocol), after Ghostty's macOS line-editing keybinds.
 ///
 /// Option follows the layout: where Option types an ASCII symbol (`@`, `|`,
 /// `\` on many European layouts) that symbol is typed; where it would type
@@ -303,11 +218,18 @@ pub fn route_key(
     key: &str,
     key_char: Option<&str>,
     mods: &Modifiers,
-    app_cursor: bool,
+    emulator: &Emulator,
 ) -> KeyRoute {
+    if let Some(bytes) = keys::macos_keybind(key, mods) {
+        return KeyRoute::Bytes(bytes);
+    }
     if mods.platform {
         return KeyRoute::NotOurs;
     }
+    let encode = |text: Option<&str>| {
+        keys::encode(emulator.terminal(), key, text, mods)
+            .map_or(KeyRoute::NotOurs, KeyRoute::Bytes)
+    };
     let printable = key_char.filter(|c| !c.is_empty() && !c.chars().any(char::is_control));
     if mods.alt && !mods.control {
         if let Some(text) = printable
@@ -317,7 +239,7 @@ pub fn route_key(
         {
             return KeyRoute::Text;
         }
-        // Meta: ESC + the key as typed without Option.
+        // Meta: the key as typed without Option.
         let base = (key.chars().count() == 1).then(|| {
             if mods.shift {
                 key.to_uppercase()
@@ -325,13 +247,12 @@ pub fn route_key(
                 key.to_string()
             }
         });
-        return keystroke_bytes(key, base.as_deref(), mods, app_cursor)
-            .map_or(KeyRoute::NotOurs, KeyRoute::Bytes);
+        return encode(base.as_deref());
     }
     if !mods.control && !mods.function && printable.is_some() && !is_named_key(key) {
         return KeyRoute::Text;
     }
-    keystroke_bytes(key, key_char, mods, app_cursor).map_or(KeyRoute::NotOurs, KeyRoute::Bytes)
+    encode(key_char)
 }
 
 fn is_named_key(key: &str) -> bool {
@@ -353,31 +274,6 @@ fn is_named_key(key: &str) -> bool {
             | "pageup"
             | "pagedown"
     ) || (key.len() >= 2 && key.starts_with('f') && key[1..].chars().all(|c| c.is_ascii_digit()))
-}
-
-/// Ctrl-key encoding (caret notation).
-fn control_bytes(key: &str) -> Option<Vec<u8>> {
-    let mut chars = key.chars();
-    let (c, rest) = (chars.next()?, chars.next());
-    if rest.is_some() {
-        return match key {
-            "space" => Some(vec![0x00]),
-            "backspace" => Some(vec![0x08]),
-            "enter" => Some(b"\r".to_vec()),
-            _ => None,
-        };
-    }
-    match c {
-        'a'..='z' => Some(vec![c as u8 - b'a' + 1]),
-        '@' => Some(vec![0x00]),
-        '[' => Some(vec![0x1b]),
-        '\\' => Some(vec![0x1c]),
-        ']' => Some(vec![0x1d]),
-        '^' => Some(vec![0x1e]),
-        '_' | '/' => Some(vec![0x1f]),
-        '?' => Some(vec![0x7f]),
-        _ => None,
-    }
 }
 
 /// Wrap pasted text for the PTY (bracketed-paste aware; strips the one control
@@ -1091,152 +987,10 @@ mod tests {
         Modifiers::default()
     }
 
-    #[test]
-    fn printables_prefer_key_char() {
-        assert_eq!(
-            keystroke_bytes("a", Some("a"), &mods(), false),
-            Some(b"a".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes(
-                "a",
-                Some("A"),
-                &Modifiers {
-                    shift: true,
-                    ..mods()
-                },
-                false
-            ),
-            Some(b"A".to_vec())
-        );
-        // Multi-byte characters pass through as UTF-8.
-        assert_eq!(
-            keystroke_bytes("e", Some("é"), &mods(), false),
-            Some("é".as_bytes().to_vec())
-        );
-        // Named single-char keys fall back to the key name.
-        assert_eq!(
-            keystroke_bytes("/", None, &mods(), false),
-            Some(b"/".to_vec())
-        );
-        // Unknown multi-char keys are not ours.
-        assert_eq!(keystroke_bytes("capslock", None, &mods(), false), None);
-    }
-
-    #[test]
-    fn control_keys_and_sequences() {
-        assert_eq!(
-            keystroke_bytes("enter", None, &mods(), false),
-            Some(b"\r".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes("backspace", None, &mods(), false),
-            Some(vec![0x7f])
-        );
-        assert_eq!(
-            keystroke_bytes("tab", None, &mods(), false),
-            Some(b"\t".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes(
-                "tab",
-                None,
-                &Modifiers {
-                    shift: true,
-                    ..mods()
-                },
-                false
-            ),
-            Some(b"\x1b[Z".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes("escape", None, &mods(), false),
-            Some(vec![0x1b])
-        );
-        assert_eq!(
-            keystroke_bytes("delete", None, &mods(), false),
-            Some(b"\x1b[3~".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes("pageup", None, &mods(), false),
-            Some(b"\x1b[5~".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes("f5", None, &mods(), false),
-            Some(b"\x1b[15~".to_vec())
-        );
-    }
-
-    #[test]
-    fn arrows_respect_app_cursor_mode() {
-        assert_eq!(
-            keystroke_bytes("up", None, &mods(), false),
-            Some(b"\x1b[A".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes("up", None, &mods(), true),
-            Some(b"\x1bOA".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes("home", None, &mods(), false),
-            Some(b"\x1b[H".to_vec())
-        );
-        assert_eq!(
-            keystroke_bytes("end", None, &mods(), true),
-            Some(b"\x1bOF".to_vec())
-        );
-    }
-
-    #[test]
-    fn ctrl_combos_map_to_control_bytes() {
-        let ctrl = Modifiers {
-            control: true,
-            ..mods()
-        };
-        assert_eq!(
-            keystroke_bytes("c", Some("c"), &ctrl, false),
-            Some(vec![0x03])
-        );
-        assert_eq!(keystroke_bytes("z", None, &ctrl, false), Some(vec![0x1a]));
-        assert_eq!(
-            keystroke_bytes("space", None, &ctrl, false),
-            Some(vec![0x00])
-        );
-        assert_eq!(keystroke_bytes("[", None, &ctrl, false), Some(vec![0x1b]));
-        assert_eq!(keystroke_bytes("_", None, &ctrl, false), Some(vec![0x1f]));
-        // Ctrl+1 has no caret encoding — not ours.
-        assert_eq!(keystroke_bytes("1", Some("1"), &ctrl, false), None);
-    }
-
-    #[test]
-    fn alt_prefixes_escape() {
-        let alt = Modifiers {
-            alt: true,
-            ..mods()
-        };
-        assert_eq!(
-            keystroke_bytes("b", Some("b"), &alt, false),
-            Some(vec![0x1b, b'b'])
-        );
-        let alt_ctrl = Modifiers {
-            alt: true,
-            control: true,
-            ..mods()
-        };
-        assert_eq!(
-            keystroke_bytes("c", None, &alt_ctrl, false),
-            Some(vec![0x1b, 0x03])
-        );
-    }
-
-    #[test]
-    fn platform_primary_combos_fall_through() {
-        let cmd = Modifiers {
-            platform: true,
-            ..mods()
-        };
-        assert_eq!(keystroke_bytes("j", Some("j"), &cmd, false), None);
-        assert_eq!(keystroke_bytes("enter", None, &cmd, false), None);
+    fn emu(setup: &[u8]) -> Emulator {
+        let mut e = Emulator::new(20, 4);
+        e.feed(setup);
+        e
     }
 
     #[test]
@@ -1245,14 +999,16 @@ mod tests {
             shift: true,
             ..mods()
         };
-        assert_eq!(route_key("a", Some("a"), &mods(), false), KeyRoute::Text);
-        assert_eq!(route_key("a", Some("A"), &shift, false), KeyRoute::Text);
+        let e = emu(b"");
+        assert_eq!(route_key("a", Some("a"), &mods(), &e), KeyRoute::Text);
+        assert_eq!(route_key("a", Some("A"), &shift, &e), KeyRoute::Text);
+        assert_eq!(route_key("ж", Some("ж"), &mods(), &e), KeyRoute::Text);
         assert_eq!(
-            route_key("enter", Some("\r"), &mods(), false),
+            route_key("enter", Some("\r"), &mods(), &e),
             KeyRoute::Bytes(b"\r".to_vec())
         );
         assert_eq!(
-            route_key("up", None, &mods(), true),
+            route_key("up", None, &mods(), &emu(b"\x1b[?1h")),
             KeyRoute::Bytes(b"\x1bOA".to_vec())
         );
         assert_eq!(
@@ -1263,7 +1019,7 @@ mod tests {
                     control: true,
                     ..mods()
                 },
-                false
+                &e
             ),
             KeyRoute::Bytes(vec![0x03])
         );
@@ -1275,7 +1031,7 @@ mod tests {
                     platform: true,
                     ..mods()
                 },
-                false
+                &e
             ),
             KeyRoute::NotOurs
         );
@@ -1287,21 +1043,43 @@ mod tests {
             alt: true,
             ..mods()
         };
+        let e = emu(b"");
         // US layout: Option-B would type `∫` — Meta-b for word motion.
         assert_eq!(
-            route_key("b", Some("∫"), &alt, false),
+            route_key("b", Some("∫"), &alt, &e),
             KeyRoute::Bytes(vec![0x1b, b'b'])
         );
         assert_eq!(
-            route_key("b", Some("ı"), &Modifiers { shift: true, ..alt }, false),
+            route_key("b", Some("ı"), &Modifiers { shift: true, ..alt }, &e),
             KeyRoute::Bytes(vec![0x1b, b'B'])
         );
         // German layout: Option-L types `@`, which is what the user meant.
-        assert_eq!(route_key("l", Some("@"), &alt, false), KeyRoute::Text);
-        // Named keys keep their Meta prefix.
+        assert_eq!(route_key("l", Some("@"), &alt, &e), KeyRoute::Text);
+        // Named keys carry Alt as a modifier, as Ghostty sends them; on macOS
+        // Option+Left/Right are a word back and forward (Ghostty's keybinds).
         assert_eq!(
-            route_key("left", None, &alt, false),
-            KeyRoute::Bytes(b"\x1b\x1b[D".to_vec())
+            route_key("up", None, &alt, &e),
+            KeyRoute::Bytes(b"\x1b[1;3A".to_vec())
+        );
+        let left = if cfg!(target_os = "macos") {
+            b"\x1bb".to_vec()
+        } else {
+            b"\x1b[1;3D".to_vec()
+        };
+        assert_eq!(route_key("left", None, &alt, &e), KeyRoute::Bytes(left));
+    }
+
+    /// The program's keyboard protocol reaches the encoder: Claude Code's
+    /// Shift+Enter is a newline once it pushes kitty's flags.
+    #[test]
+    fn keys_follow_the_programs_keyboard_protocol() {
+        let shift = Modifiers {
+            shift: true,
+            ..mods()
+        };
+        assert_eq!(
+            route_key("enter", Some("\r"), &shift, &emu(b"\x1b[>1u")),
+            KeyRoute::Bytes(b"\x1b[13;2u".to_vec())
         );
     }
 
