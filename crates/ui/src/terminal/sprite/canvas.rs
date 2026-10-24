@@ -3,7 +3,9 @@
 //! z2d is replaced by tiny-skia; coordinates passed in are cell-relative and
 //! the padding offset is applied here.
 
-use tiny_skia::{FillRule, LineCap, Paint, Path, PathBuilder, Pixmap, PremultipliedColorU8, Stroke, Transform};
+use tiny_skia::{
+    FillRule, LineCap, Paint, Path, PathBuilder, Pixmap, PremultipliedColorU8, Stroke, Transform,
+};
 
 /// Pixel coverage. Ghostty's `Color`/`Shade`: anything 0…255.
 pub type Color = u8;
@@ -44,8 +46,11 @@ pub struct Canvas {
 impl Canvas {
     pub fn new(width: u32, height: u32, padding_x: u32, padding_y: u32) -> Canvas {
         Canvas {
-            pixmap: Pixmap::new((width + 2 * padding_x).max(1), (height + 2 * padding_y).max(1))
-                .expect("canvas size"),
+            pixmap: Pixmap::new(
+                (width + 2 * padding_x).max(1),
+                (height + 2 * padding_y).max(1),
+            )
+            .expect("canvas size"),
             padding_x,
             padding_y,
             clip_top: 0,
@@ -76,7 +81,8 @@ impl Canvas {
             return;
         }
         let ix = y as usize * self.pixmap.width() as usize + x as usize;
-        self.pixmap.pixels_mut()[ix] = PremultipliedColorU8::from_rgba(color, color, color, color).unwrap();
+        self.pixmap.pixels_mut()[ix] =
+            PremultipliedColorU8::from_rgba(color, color, color, color).unwrap();
     }
 
     /// Fill a rectangle, replacing what is there. The main primitive: lines
@@ -93,7 +99,15 @@ impl Canvas {
     pub fn box_(&mut self, x0: i32, y0: i32, x1: i32, y1: i32, color: Color) {
         let (l, r) = (x0.min(x1), x0.max(x1));
         let (t, b) = (y0.min(y1), y0.max(y1));
-        self.rect(Rect { x: l, y: t, width: r - l, height: b - t }, color);
+        self.rect(
+            Rect {
+                x: l,
+                y: t,
+                width: r - l,
+                height: b - t,
+            },
+            color,
+        );
     }
 
     pub fn quad(&mut self, p: [Point<f64>; 4], color: Color) {
@@ -132,7 +146,8 @@ impl Canvas {
     /// Fill a cell-coordinate path (non-zero rule, anti-aliased, src-over).
     pub fn fill_path(&mut self, path: &Path, color: Color) {
         let transform = self.transform();
-        self.pixmap.fill_path(path, &paint(color), FillRule::Winding, transform, None);
+        self.pixmap
+            .fill_path(path, &paint(color), FillRule::Winding, transform, None);
     }
 
     /// Stroke a cell-coordinate path (anti-aliased, src-over). Filled as the
@@ -206,5 +221,10 @@ fn paint(color: Color) -> Paint<'static> {
 
 /// z2d's stroke defaults: butt caps, miter joins with limit 10.
 pub fn stroke(width: f64) -> Stroke {
-    Stroke { width: width as f32, line_cap: LineCap::Butt, miter_limit: 10.0, ..Stroke::default() }
+    Stroke {
+        width: width as f32,
+        line_cap: LineCap::Butt,
+        miter_limit: 10.0,
+        ..Stroke::default()
+    }
 }

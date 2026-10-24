@@ -228,7 +228,9 @@ impl Emulator {
 
     /// The kitty keyboard flags the running program pushed (empty: legacy keys).
     pub fn kitty_keyboard_flags(&self) -> KittyKeyFlags {
-        self.term.kitty_keyboard_flags().unwrap_or(KittyKeyFlags::empty())
+        self.term
+            .kitty_keyboard_flags()
+            .unwrap_or(KittyKeyFlags::empty())
     }
 
     /// The terminal, for Ghostty's key encoder to read its modes from.
@@ -250,7 +252,8 @@ impl Emulator {
 
     /// Scroll the view: positive = up into history, negative = toward live.
     pub fn scroll(&mut self, delta: i32) {
-        self.term.scroll_viewport(ScrollViewport::Delta(-(delta as isize)));
+        self.term
+            .scroll_viewport(ScrollViewport::Delta(-(delta as isize)));
     }
 
     pub fn scroll_to_bottom(&mut self) {
@@ -275,7 +278,9 @@ impl Emulator {
             u16::try_from(point.col).ok()?,
             u32::try_from(point.row).ok()?,
         );
-        self.term.grid_ref(Point::Screen(PointCoordinate { x, y })).ok()
+        self.term
+            .grid_ref(Point::Screen(PointCoordinate { x, y }))
+            .ok()
     }
 
     fn point_of(&self, grid_ref: &GridRef<'_>) -> Option<GridPoint> {
@@ -363,7 +368,11 @@ impl Emulator {
             }
         };
         let selection = range.and_then(|(start, end)| {
-            Some(Selection::new(self.grid_ref(start)?, self.grid_ref(end)?, false))
+            Some(Selection::new(
+                self.grid_ref(start)?,
+                self.grid_ref(end)?,
+                false,
+            ))
         });
         let _ = self.term.set_selection(selection.as_ref());
     }
@@ -401,7 +410,10 @@ impl Emulator {
     /// Snapshot one viewport row (0 = top) honoring the scrollback offset.
     // ponytail: snapshots the whole viewport; only tests ask for one row.
     pub fn line(&self, viewport_row: usize) -> Vec<CellSnapshot> {
-        self.lines().into_iter().nth(viewport_row).unwrap_or_default()
+        self.lines()
+            .into_iter()
+            .nth(viewport_row)
+            .unwrap_or_default()
     }
 
     /// All viewport rows, top to bottom.
@@ -433,7 +445,8 @@ impl Emulator {
                     .cloned()
                 {
                     for (col, cell) in line.iter_mut().enumerate() {
-                        cell.selected = selected.as_ref().is_some_and(|r| r.contains(&(col as u16)));
+                        cell.selected =
+                            selected.as_ref().is_some_and(|r| r.contains(&(col as u16)));
                     }
                     lines.push(line);
                     continue;
@@ -442,7 +455,11 @@ impl Emulator {
                 let mut cell_iter = cells.update(row)?;
                 while let Some(cell) = cell_iter.next() {
                     let raw = cell.raw_cell()?;
-                    let style = if cell.has_styling()? { cell.style()? } else { plain };
+                    let style = if cell.has_styling()? {
+                        cell.style()?
+                    } else {
+                        plain
+                    };
                     // An erase with a background set stores the color in the cell, not a style.
                     let tag = raw.content_tag()?;
                     let bg = match tag {
@@ -545,7 +562,10 @@ fn simple_range(
                 row: end.row.checked_sub(1)?,
                 col: cols.saturating_sub(1),
             },
-            col => GridPoint { col: col - 1, ..end },
+            col => GridPoint {
+                col: col - 1,
+                ..end
+            },
         };
     }
     (start <= end).then_some((start, end))
@@ -680,10 +700,7 @@ mod tests {
         e.feed(b"one\r\ntwo\r\nthree");
         assert_eq!(e.row_text(1), "two");
         e.feed(b"\x1b[2;1HTWO");
-        assert_eq!(
-            (e.row_text(0), e.row_text(1)),
-            ("one".into(), "TWO".into())
-        );
+        assert_eq!((e.row_text(0), e.row_text(1)), ("one".into(), "TWO".into()));
         e.start_selection(SelectionType::Simple, e.grid_point(0, 0), Side::Left);
         e.update_selection(e.grid_point(0, 2), Side::Right);
         assert!(e.line(0)[1].selected);
@@ -834,7 +851,10 @@ mod tests {
         let mut e = emu(10, 2);
         assert!(e.kitty_keyboard_flags().is_empty());
         e.feed(b"\x1b[>1u");
-        assert!(e.kitty_keyboard_flags().contains(KittyKeyFlags::DISAMBIGUATE));
+        assert!(
+            e.kitty_keyboard_flags()
+                .contains(KittyKeyFlags::DISAMBIGUATE)
+        );
         e.feed(b"\x1b[<u");
         assert!(e.kitty_keyboard_flags().is_empty());
     }
@@ -979,10 +999,7 @@ mod tests {
         e.feed(b"three\r\nfour\r\n");
         // "one" is in history now; the pointer is on the viewport's last text row.
         e.update_selection(e.grid_point(1, 3), Side::Right);
-        assert_eq!(
-            e.selection_text().as_deref(),
-            Some("one\ntwo\nthree\nfour")
-        );
+        assert_eq!(e.selection_text().as_deref(), Some("one\ntwo\nthree\nfour"));
     }
 
     /// A drag scrolled into history copies from history.

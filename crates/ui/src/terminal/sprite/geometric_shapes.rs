@@ -69,10 +69,19 @@ pub fn corner_triangle_outline(metrics: &Metrics, canvas: &mut Canvas, corner: C
 /// `width / 2`, so the stroke's outer edge lies on the original path.
 /// "Inward" is the side the polyline turns towards (the interior of a
 /// closed shape). Curves must be flattened by the caller.
-pub(super) fn inner_stroke_polyline(canvas: &mut Canvas, points: &[(f64, f64)], closed: bool, width: f64, color: u8) {
+pub(super) fn inner_stroke_polyline(
+    canvas: &mut Canvas,
+    points: &[(f64, f64)],
+    closed: bool,
+    width: f64,
+    color: u8,
+) {
     let mut pts: Vec<(f64, f64)> = Vec::with_capacity(points.len());
     for &p in points {
-        if pts.last().is_none_or(|&q: &(f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) > 1e-9) {
+        if pts
+            .last()
+            .is_none_or(|&q: &(f64, f64)| (q.0 - p.0).hypot(q.1 - p.1) > 1e-9)
+        {
             pts.push(p);
         }
     }
@@ -92,7 +101,11 @@ pub(super) fn inner_stroke_polyline(canvas: &mut Canvas, points: &[(f64, f64)], 
         let (a, b) = (pts[i], pts[(i + 1) % n]);
         area += a.0 * b.1 - b.0 * a.1;
     }
-    let d = if area >= 0.0 { width / 2.0 } else { -width / 2.0 };
+    let d = if area >= 0.0 {
+        width / 2.0
+    } else {
+        -width / 2.0
+    };
 
     // Each segment offset along its right-hand normal (−dy, dx) by `d`.
     let seg = |i: usize| -> ((f64, f64), (f64, f64)) {

@@ -20,7 +20,12 @@ pub fn draw_2500_257f(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, m
     use Style::{Double as D, Heavy as H, Light as L, None as N};
     let m = metrics;
     // Lines in (up, right, down, left) order.
-    let l = |up, right, down, left| Lines { up, right, down, left };
+    let l = |up, right, down, left| Lines {
+        up,
+        right,
+        down,
+        left,
+    };
     let light = Thickness::Light.height(m.box_thickness);
     let heavy = Thickness::Heavy.height(m.box_thickness);
     let gap = light.max(4);
@@ -215,7 +220,11 @@ pub fn lines_char(metrics: &Metrics, canvas: &mut Canvas, lines: Lines) {
     let up_bottom = if lines.left == Heavy || lines.right == Heavy {
         h_heavy_bottom
     } else if lines.left != lines.right || lines.down == lines.up {
-        if lines.left == Double || lines.right == Double { h_double_bottom } else { h_light_bottom }
+        if lines.left == Double || lines.right == Double {
+            h_double_bottom
+        } else {
+            h_light_bottom
+        }
     } else if lines.left == None && lines.right == None {
         h_light_bottom
     } else {
@@ -226,7 +235,11 @@ pub fn lines_char(metrics: &Metrics, canvas: &mut Canvas, lines: Lines) {
     let down_top = if lines.left == Heavy || lines.right == Heavy {
         h_heavy_top
     } else if lines.left != lines.right || lines.up == lines.down {
-        if lines.left == Double || lines.right == Double { h_double_top } else { h_light_top }
+        if lines.left == Double || lines.right == Double {
+            h_double_top
+        } else {
+            h_light_top
+        }
     } else if lines.left == None && lines.right == None {
         h_light_top
     } else {
@@ -237,7 +250,11 @@ pub fn lines_char(metrics: &Metrics, canvas: &mut Canvas, lines: Lines) {
     let left_right = if lines.up == Heavy || lines.down == Heavy {
         v_heavy_right
     } else if lines.up != lines.down || lines.left == lines.right {
-        if lines.up == Double || lines.down == Double { v_double_right } else { v_light_right }
+        if lines.up == Double || lines.down == Double {
+            v_double_right
+        } else {
+            v_light_right
+        }
     } else if lines.up == None && lines.down == None {
         v_light_right
     } else {
@@ -248,7 +265,11 @@ pub fn lines_char(metrics: &Metrics, canvas: &mut Canvas, lines: Lines) {
     let right_left = if lines.up == Heavy || lines.down == Heavy {
         v_heavy_left
     } else if lines.up != lines.down || lines.right == lines.left {
-        if lines.up == Double || lines.down == Double { v_double_left } else { v_light_left }
+        if lines.up == Double || lines.down == Double {
+            v_double_left
+        } else {
+            v_light_left
+        }
     } else if lines.up == None && lines.down == None {
         v_light_left
     } else {
@@ -264,8 +285,16 @@ pub fn lines_char(metrics: &Metrics, canvas: &mut Canvas, lines: Lines) {
         Light => fill(v_light_left, 0, v_light_right, up_bottom),
         Heavy => fill(v_heavy_left, 0, v_heavy_right, up_bottom),
         Double => {
-            let left_bottom = if lines.left == Double { h_light_top } else { up_bottom };
-            let right_bottom = if lines.right == Double { h_light_top } else { up_bottom };
+            let left_bottom = if lines.left == Double {
+                h_light_top
+            } else {
+                up_bottom
+            };
+            let right_bottom = if lines.right == Double {
+                h_light_top
+            } else {
+                up_bottom
+            };
             fill(v_double_left, 0, v_light_left, left_bottom);
             fill(v_light_right, 0, v_double_right, right_bottom);
         }
@@ -276,8 +305,16 @@ pub fn lines_char(metrics: &Metrics, canvas: &mut Canvas, lines: Lines) {
         Light => fill(right_left, h_light_top, cw, h_light_bottom),
         Heavy => fill(right_left, h_heavy_top, cw, h_heavy_bottom),
         Double => {
-            let top_left = if lines.up == Double { v_light_right } else { right_left };
-            let bottom_left = if lines.down == Double { v_light_right } else { right_left };
+            let top_left = if lines.up == Double {
+                v_light_right
+            } else {
+                right_left
+            };
+            let bottom_left = if lines.down == Double {
+                v_light_right
+            } else {
+                right_left
+            };
             fill(top_left, h_double_top, cw, h_light_top);
             fill(bottom_left, h_light_bottom, cw, h_double_bottom);
         }
@@ -288,8 +325,16 @@ pub fn lines_char(metrics: &Metrics, canvas: &mut Canvas, lines: Lines) {
         Light => fill(v_light_left, down_top, v_light_right, ch),
         Heavy => fill(v_heavy_left, down_top, v_heavy_right, ch),
         Double => {
-            let left_top = if lines.left == Double { h_light_bottom } else { down_top };
-            let right_top = if lines.right == Double { h_light_bottom } else { down_top };
+            let left_top = if lines.left == Double {
+                h_light_bottom
+            } else {
+                down_top
+            };
+            let right_top = if lines.right == Double {
+                h_light_bottom
+            } else {
+                down_top
+            };
             fill(v_double_left, left_top, v_light_left, ch);
             fill(v_light_right, right_top, v_double_right, ch);
         }
@@ -300,8 +345,16 @@ pub fn lines_char(metrics: &Metrics, canvas: &mut Canvas, lines: Lines) {
         Light => fill(0, h_light_top, left_right, h_light_bottom),
         Heavy => fill(0, h_heavy_top, left_right, h_heavy_bottom),
         Double => {
-            let top_right = if lines.up == Double { v_light_left } else { left_right };
-            let bottom_right = if lines.down == Double { v_light_left } else { left_right };
+            let top_right = if lines.up == Double {
+                v_light_left
+            } else {
+                left_right
+            };
+            let bottom_right = if lines.down == Double {
+                v_light_left
+            } else {
+                left_right
+            };
             fill(0, h_double_top, top_right, h_light_top);
             fill(0, h_light_bottom, bottom_right, h_double_bottom);
         }
@@ -380,7 +433,13 @@ pub fn arc(metrics: &Metrics, canvas: &mut Canvas, corner: Corner, thickness: Th
     }
 }
 
-fn dash_horizontal(metrics: &Metrics, canvas: &mut Canvas, count: u32, thick_px: u32, desired_gap: u32) {
+fn dash_horizontal(
+    metrics: &Metrics,
+    canvas: &mut Canvas,
+    count: u32,
+    thick_px: u32,
+    desired_gap: u32,
+) {
     debug_assert!((2..=4).contains(&count));
 
     // For N dashes there are N - 1 gaps between them plus half-sized gaps
@@ -420,7 +479,13 @@ fn dash_horizontal(metrics: &Metrics, canvas: &mut Canvas, count: u32, thick_px:
     }
 }
 
-fn dash_vertical(metrics: &Metrics, canvas: &mut Canvas, count: u32, thick_px: u32, desired_gap: u32) {
+fn dash_vertical(
+    metrics: &Metrics,
+    canvas: &mut Canvas,
+    count: u32,
+    thick_px: u32,
+    desired_gap: u32,
+) {
     debug_assert!((2..=4).contains(&count));
 
     // One full-sized extra gap at the bottom (rather than two half-sized

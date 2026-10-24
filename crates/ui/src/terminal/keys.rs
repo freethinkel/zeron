@@ -106,8 +106,8 @@ fn physical_key(key: &str) -> Key {
         Digit0, Digit1, Digit2, Digit3, Digit4, Digit5, Digit6, Digit7, Digit8, Digit9,
     ];
     const FUNCTION: [Key; 24] = [
-        F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18,
-        F19, F20, F21, F22, F23, F24,
+        F1, F2, F3, F4, F5, F6, F7, F8, F9, F10, F11, F12, F13, F14, F15, F16, F17, F18, F19, F20,
+        F21, F22, F23, F24,
     ];
     let mut chars = key.chars();
     if let (Some(c), None) = (chars.next(), chars.next()) {
@@ -177,7 +177,10 @@ mod tests {
     #[test]
     fn printables_prefer_key_char() {
         assert_eq!(plain("a", Some("a"), mods()), Some(b"a".to_vec()));
-        let shift = Modifiers { shift: true, ..mods() };
+        let shift = Modifiers {
+            shift: true,
+            ..mods()
+        };
         assert_eq!(plain("a", Some("A"), shift), Some(b"A".to_vec()));
         // Multi-byte characters pass through as UTF-8.
         assert_eq!(plain("e", Some("é"), mods()), Some("é".as_bytes().to_vec()));
@@ -193,7 +196,10 @@ mod tests {
         assert_eq!(plain("enter", None, mods()), Some(b"\r".to_vec()));
         assert_eq!(plain("backspace", None, mods()), Some(vec![0x7f]));
         assert_eq!(plain("tab", None, mods()), Some(b"\t".to_vec()));
-        let shift = Modifiers { shift: true, ..mods() };
+        let shift = Modifiers {
+            shift: true,
+            ..mods()
+        };
         assert_eq!(plain("tab", None, shift), Some(b"\x1b[Z".to_vec()));
         assert_eq!(plain("escape", None, mods()), Some(vec![0x1b]));
         assert_eq!(plain("space", None, mods()), Some(b" ".to_vec()));
@@ -206,17 +212,29 @@ mod tests {
     #[test]
     fn arrows_respect_app_cursor_mode() {
         assert_eq!(plain("up", None, mods()), Some(b"\x1b[A".to_vec()));
-        assert_eq!(enc(b"\x1b[?1h", "up", None, mods()), Some(b"\x1bOA".to_vec()));
+        assert_eq!(
+            enc(b"\x1b[?1h", "up", None, mods()),
+            Some(b"\x1bOA".to_vec())
+        );
         assert_eq!(plain("home", None, mods()), Some(b"\x1b[H".to_vec()));
-        assert_eq!(enc(b"\x1b[?1h", "end", None, mods()), Some(b"\x1bOF".to_vec()));
+        assert_eq!(
+            enc(b"\x1b[?1h", "end", None, mods()),
+            Some(b"\x1bOF".to_vec())
+        );
         // Modified arrows carry their modifiers, as xterm and Ghostty send them.
-        let shift = Modifiers { shift: true, ..mods() };
+        let shift = Modifiers {
+            shift: true,
+            ..mods()
+        };
         assert_eq!(plain("up", None, shift), Some(b"\x1b[1;2A".to_vec()));
     }
 
     #[test]
     fn ctrl_combos_map_to_control_bytes() {
-        let ctrl = Modifiers { control: true, ..mods() };
+        let ctrl = Modifiers {
+            control: true,
+            ..mods()
+        };
         assert_eq!(plain("c", Some("c"), ctrl), Some(vec![0x03]));
         assert_eq!(plain("z", None, ctrl), Some(vec![0x1a]));
         assert_eq!(plain("space", None, ctrl), Some(vec![0x00]));
@@ -231,8 +249,15 @@ mod tests {
     /// `macos-option-as-alt = false`): the layout's text goes as typed.
     #[test]
     fn alt_prefixes_escape_but_not_macos_option() {
-        let alt = Modifiers { alt: true, ..mods() };
-        let alt_ctrl = Modifiers { alt: true, control: true, ..mods() };
+        let alt = Modifiers {
+            alt: true,
+            ..mods()
+        };
+        let alt_ctrl = Modifiers {
+            alt: true,
+            control: true,
+            ..mods()
+        };
         if cfg!(target_os = "macos") {
             assert_eq!(plain("b", Some("b"), alt), Some(b"b".to_vec()));
         } else {
@@ -250,7 +275,10 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn option_sends_the_character_macos_composed() {
-        let alt = Modifiers { alt: true, ..mods() };
+        let alt = Modifiers {
+            alt: true,
+            ..mods()
+        };
         assert_eq!(plain("b", Some("∫"), alt), Some("∫".as_bytes().to_vec()));
         assert_eq!(plain("l", Some("@"), alt), Some(b"@".to_vec()));
     }
@@ -258,18 +286,43 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn ghostty_macos_line_editing_keybinds() {
-        let cmd = Modifiers { platform: true, ..mods() };
-        let alt = Modifiers { alt: true, ..mods() };
-        assert_eq!(plain("left", None, cmd), Some(vec![0x01]), "the line's start");
-        assert_eq!(plain("right", None, cmd), Some(vec![0x05]), "the line's end");
+        let cmd = Modifiers {
+            platform: true,
+            ..mods()
+        };
+        let alt = Modifiers {
+            alt: true,
+            ..mods()
+        };
+        assert_eq!(
+            plain("left", None, cmd),
+            Some(vec![0x01]),
+            "the line's start"
+        );
+        assert_eq!(
+            plain("right", None, cmd),
+            Some(vec![0x05]),
+            "the line's end"
+        );
         assert_eq!(plain("backspace", None, cmd), Some(vec![0x15]));
-        assert_eq!(plain("left", None, alt), Some(b"\x1bb".to_vec()), "a word back");
-        assert_eq!(plain("right", None, alt), Some(b"\x1bf".to_vec()), "a word forward");
+        assert_eq!(
+            plain("left", None, alt),
+            Some(b"\x1bb".to_vec()),
+            "a word back"
+        );
+        assert_eq!(
+            plain("right", None, alt),
+            Some(b"\x1bf".to_vec()),
+            "a word forward"
+        );
     }
 
     #[test]
     fn platform_primary_combos_fall_through() {
-        let cmd = Modifiers { platform: true, ..mods() };
+        let cmd = Modifiers {
+            platform: true,
+            ..mods()
+        };
         assert_eq!(plain("j", Some("j"), cmd), None);
         assert_eq!(plain("enter", None, cmd), None);
     }
@@ -280,13 +333,31 @@ mod tests {
     #[test]
     fn kitty_keyboard_protocol_when_the_program_asks() {
         let kitty = b"\x1b[>1u";
-        let shift = Modifiers { shift: true, ..mods() };
-        let ctrl = Modifiers { control: true, ..mods() };
-        assert_eq!(enc(kitty, "enter", None, shift), Some(b"\x1b[13;2u".to_vec()));
-        assert_eq!(enc(kitty, "enter", None, ctrl), Some(b"\x1b[13;5u".to_vec()));
+        let shift = Modifiers {
+            shift: true,
+            ..mods()
+        };
+        let ctrl = Modifiers {
+            control: true,
+            ..mods()
+        };
+        assert_eq!(
+            enc(kitty, "enter", None, shift),
+            Some(b"\x1b[13;2u".to_vec())
+        );
+        assert_eq!(
+            enc(kitty, "enter", None, ctrl),
+            Some(b"\x1b[13;5u".to_vec())
+        );
         assert_eq!(enc(kitty, "tab", None, ctrl), Some(b"\x1b[9;5u".to_vec()));
-        assert_eq!(enc(kitty, "c", Some("c"), ctrl), Some(b"\x1b[99;5u".to_vec()));
-        assert_eq!(enc(kitty, "escape", None, mods()), Some(b"\x1b[27u".to_vec()));
+        assert_eq!(
+            enc(kitty, "c", Some("c"), ctrl),
+            Some(b"\x1b[99;5u".to_vec())
+        );
+        assert_eq!(
+            enc(kitty, "escape", None, mods()),
+            Some(b"\x1b[27u".to_vec())
+        );
         // Plain text stays text.
         assert_eq!(enc(kitty, "a", Some("a"), mods()), Some(b"a".to_vec()));
         assert_eq!(enc(kitty, "enter", None, mods()), Some(b"\r".to_vec()));

@@ -67,8 +67,16 @@ pub fn draw_2800_28ff(cp: u32, canvas: &mut Canvas, width: u32, height: u32, _me
     }
 
     // (bit, column, row)
-    const DOTS: [(u32, usize, usize); 8] =
-        [(0, 0, 0), (1, 0, 1), (2, 0, 2), (3, 1, 0), (4, 1, 1), (5, 1, 2), (6, 0, 3), (7, 1, 3)];
+    const DOTS: [(u32, usize, usize); 8] = [
+        (0, 0, 0),
+        (1, 0, 1),
+        (2, 0, 2),
+        (3, 1, 0),
+        (4, 1, 1),
+        (5, 1, 2),
+        (6, 0, 3),
+        (7, 1, 3),
+    ];
     for (bit, col, row) in DOTS {
         if cp & (1 << bit) != 0 {
             canvas.box_(x[col], y[row], x[col] + w, y[row] + w, ON);

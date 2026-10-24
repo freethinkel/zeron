@@ -98,7 +98,10 @@ pub struct Alignment {
 
 impl Alignment {
     const fn new(horizontal: Horizontal, vertical: Vertical) -> Alignment {
-        Alignment { horizontal, vertical }
+        Alignment {
+            horizontal,
+            vertical,
+        }
     }
     pub const CENTER: Alignment = Alignment::new(Horizontal::Center, Vertical::Middle);
     pub const UPPER: Alignment = Alignment::new(Horizontal::Center, Vertical::Top);
@@ -141,9 +144,19 @@ impl Fraction {
         Fraction::SevenEighths,
         Fraction::One,
     ];
-    pub const QUARTERS: [Fraction; 5] =
-        [Fraction::Zero, Fraction::OneQuarter, Fraction::Half, Fraction::ThreeQuarters, Fraction::One];
-    pub const THIRDS: [Fraction; 4] = [Fraction::Zero, Fraction::OneThird, Fraction::TwoThirds, Fraction::One];
+    pub const QUARTERS: [Fraction; 5] = [
+        Fraction::Zero,
+        Fraction::OneQuarter,
+        Fraction::Half,
+        Fraction::ThreeQuarters,
+        Fraction::One,
+    ];
+    pub const THIRDS: [Fraction; 4] = [
+        Fraction::Zero,
+        Fraction::OneThird,
+        Fraction::TwoThirds,
+        Fraction::One,
+    ];
     pub const HALVES: [Fraction; 3] = [Fraction::Zero, Fraction::Half, Fraction::One];
 
     pub fn fraction(self) -> f64 {
@@ -181,7 +194,14 @@ impl Fraction {
 }
 
 /// Fill the section of the cell between two pairs of fraction lines.
-pub fn fill(metrics: &Metrics, canvas: &mut Canvas, x0: Fraction, x1: Fraction, y0: Fraction, y1: Fraction) {
+pub fn fill(
+    metrics: &Metrics,
+    canvas: &mut Canvas,
+    x0: Fraction,
+    x1: Fraction,
+    y0: Fraction,
+    y1: Fraction,
+) {
     canvas.box_(
         x0.min(metrics.cell_width),
         y0.min(metrics.cell_height),

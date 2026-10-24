@@ -30,7 +30,13 @@ pub fn draw_f5d0_f60d(cp: u32, canvas: &mut Canvas, _width: u32, _height: u32, m
     let m = metrics;
     let c = canvas;
     let l = Thickness::Light;
-    let n = |up, right, down, left, filled| BranchNode { up, right, down, left, filled };
+    let n = |up, right, down, left, filled| BranchNode {
+        up,
+        right,
+        down,
+        left,
+        filled,
+    };
     match cp {
         0xf5d0 => hline_middle(m, c, l),
         0xf5d1 => vline_middle(m, c, l),
@@ -188,7 +194,13 @@ fn branch_node(metrics: &Metrics, canvas: &mut Canvas, node: BranchNode, thickne
     let r = cx.min(cy).min((float_width - cx).min(float_height - cy));
 
     if node.up {
-        canvas.box_(v_left as i32, 0, v_right as i32, (cy - r + float_thick / 2.0).ceil() as i32, canvas::ON);
+        canvas.box_(
+            v_left as i32,
+            0,
+            v_right as i32,
+            (cy - r + float_thick / 2.0).ceil() as i32,
+            canvas::ON,
+        );
     }
     if node.right {
         canvas.box_(
@@ -209,7 +221,13 @@ fn branch_node(metrics: &Metrics, canvas: &mut Canvas, node: BranchNode, thickne
         );
     }
     if node.left {
-        canvas.box_(0, h_top as i32, (cx - r + float_thick / 2.0).ceil() as i32, h_bottom as i32, canvas::ON);
+        canvas.box_(
+            0,
+            h_top as i32,
+            (cx - r + float_thick / 2.0).ceil() as i32,
+            h_bottom as i32,
+            canvas::ON,
+        );
     }
 
     let on: canvas::Color = Shade::On.into();
@@ -224,7 +242,10 @@ fn branch_node(metrics: &Metrics, canvas: &mut Canvas, node: BranchNode, thickne
         // Fill the stroke's outline rather than `stroke_path`: tiny-skia
         // draws strokes 1px wide or thinner as alpha-scaled hairlines, while
         // z2d always fills the stroke outline with area coverage.
-        if let Some(outline) = pb.finish().and_then(|p| p.stroke(&canvas::stroke(float_thick), 1.0)) {
+        if let Some(outline) = pb
+            .finish()
+            .and_then(|p| p.stroke(&canvas::stroke(float_thick), 1.0))
+        {
             canvas.fill_path(&outline, on);
         }
     }

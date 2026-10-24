@@ -71,15 +71,33 @@ pub fn draw_e0b5(_cp: u32, canvas: &mut Canvas, width: u32, height: u32, metrics
     // caps are perpendicular (see Ghostty). The curves are flattened finely
     // since the inset is computed on a polyline.
     let mut points = vec![(0.0, 0.0), (1.0, 0.0)];
-    cubic_points(&mut points, (1.0, 0.0), (r * c, 0.0), (r, r - r * c), (r, r));
+    cubic_points(
+        &mut points,
+        (1.0, 0.0),
+        (r * c, 0.0),
+        (r, r - r * c),
+        (r, r),
+    );
     points.push((r, h - r));
-    cubic_points(&mut points, (r, h - r), (r, h - r + r * c), (r * c, h), (1.0, h));
+    cubic_points(
+        &mut points,
+        (r, h - r),
+        (r, h - r + r * c),
+        (r * c, h),
+        (1.0, h),
+    );
     points.push((0.0, h));
     inner_stroke_polyline(canvas, &points, false, metrics.box_thickness as f64, ON);
 }
 
 /// Append the flattened cubic from `p0` (already in `out`) to `p3`.
-fn cubic_points(out: &mut Vec<(f64, f64)>, p0: (f64, f64), p1: (f64, f64), p2: (f64, f64), p3: (f64, f64)) {
+fn cubic_points(
+    out: &mut Vec<(f64, f64)>,
+    p0: (f64, f64),
+    p1: (f64, f64),
+    p2: (f64, f64),
+    p3: (f64, f64),
+) {
     const STEPS: usize = 64;
     for i in 1..=STEPS {
         let t = i as f64 / STEPS as f64;
@@ -153,8 +171,24 @@ pub fn draw_e0d2(_cp: u32, canvas: &mut Canvas, width: u32, height: u32, metrics
     let (w, h) = (width as f64, height as f64);
     let t = metrics.box_thickness as f64;
     // Top piece, then bottom piece.
-    canvas.quad([pt(0.0, 0.0), pt(w, 0.0), pt(w / 2.0, h / 2.0 - t / 2.0), pt(0.0, h / 2.0 - t / 2.0)], ON);
-    canvas.quad([pt(0.0, h), pt(w, h), pt(w / 2.0, h / 2.0 + t / 2.0), pt(0.0, h / 2.0 + t / 2.0)], ON);
+    canvas.quad(
+        [
+            pt(0.0, 0.0),
+            pt(w, 0.0),
+            pt(w / 2.0, h / 2.0 - t / 2.0),
+            pt(0.0, h / 2.0 - t / 2.0),
+        ],
+        ON,
+    );
+    canvas.quad(
+        [
+            pt(0.0, h),
+            pt(w, h),
+            pt(w / 2.0, h / 2.0 + t / 2.0),
+            pt(0.0, h / 2.0 + t / 2.0),
+        ],
+        ON,
+    );
 }
 
 /// U+E0D4

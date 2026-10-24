@@ -118,9 +118,9 @@ fn main() -> anyhow::Result<()> {
                     // The first frame sizes the grid; feed after it so nothing reflows.
                     pause(cx).await;
                     window.update(cx, |fixture, _, cx| {
-                        fixture
-                            .0
-                            .update(cx, |panel, cx| panel.feed_tab(CHAT, key, sample().as_bytes(), cx))
+                        fixture.0.update(cx, |panel, cx| {
+                            panel.feed_tab(CHAT, key, sample().as_bytes(), cx)
+                        })
                     })?;
                     for (mode, name) in [
                         (appearance::AppearanceMode::Dark, "terminal-dark.png"),
