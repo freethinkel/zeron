@@ -19,9 +19,9 @@ use std::time::Duration;
 
 use base64::Engine as _;
 use gpui::{
-    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta, SharedString,
-    Subscription, Task, Window, actions, div, prelude::*, px,
+    App, Context, Entity, FocusHandle, IntoElement, KeyBinding, KeyDownEvent, Modifiers,
+    MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Render, ScrollDelta,
+    SharedString, Subscription, Task, Window, actions, div, prelude::*, px,
 };
 
 use zeron_proto::{TerminalEvent, TerminalSession};
@@ -35,6 +35,7 @@ use crate::theme::Theme;
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
 use super::keys::key_bytes;
+use super::mouse::{self, MouseEncoder};
 use super::view::{
     COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
     cell_at, paste_bytes, terminal_panel_bg,
@@ -235,6 +236,17 @@ fn rail_parts(line_h: f32, rows: usize, history: usize, display_offset: usize) -
 /// Alacritty uses positive deltas for history (up) and negative deltas for the
 /// live bottom. Speed is line-based because the terminal cannot expose partial
 /// rows without breaking its fixed grid.
+/// The button a program hears for a gpui one.
+fn report_button(button: MouseButton) -> mouse::Button {
+    match button {
+        MouseButton::Left => mouse::Button::Left,
+        MouseButton::Right => mouse::Button::Right,
+        MouseButton::Middle => mouse::Button::Middle,
+        MouseButton::Navigate(gpui::NavigationDirection::Back) => mouse::Button::Eight,
+        MouseButton::Navigate(gpui::NavigationDirection::Forward) => mouse::Button::Nine,
+    }
+}
+
 fn selection_scroll_lines(geometry: GridGeometry, position: gpui::Point<Pixels>) -> i32 {
     let grid_height = geometry.line_h * geometry.rows as f32;
     if grid_height <= 0.0 {
@@ -263,6 +275,8 @@ struct TerminalTab {
     terminal_id: Option<String>,
     target_device_id: Option<String>,
     emulator: Emulator,
+    /// Pointer events for a program that reads the mouse.
+    mouse: MouseEncoder,
     /// Fractional wheel movement in rows, retained across trackpad events.
     scroll_remainder: f32,
     exited: Option<i32>,
@@ -348,6 +362,9 @@ pub struct TerminalPanel {
     geometry: Option<GridGeometry>,
     /// Left-button gesture in flight, if any.
     selection_drag: Option<SelectionDrag>,
+    /// The button whose press went to the program: its drags and its release
+    /// follow it there, wherever the pointer is let go.
+    mouse_report: Option<MouseButton>,
     /// One-shot timer rescheduled only while a live selection remains in an
     /// edge zone.
     selection_scroll_task: Option<Task<()>>,
@@ -380,6 +397,7 @@ impl TerminalPanel {
             last_selected: None,
             geometry: None,
             selection_drag: None,
+            mouse_report: None,
             selection_scroll_task: None,
             rail_tab_key: None,
             bar: MenuScrollbarState::default(),
@@ -493,6 +511,7 @@ impl TerminalPanel {
             terminal_id: None,
             target_device_id: None,
             emulator: Emulator::new(80, 24),
+            mouse: MouseEncoder::default(),
             scroll_remainder: 0.0,
             exited: None,
             last_seq: 0,
@@ -1113,13 +1132,85 @@ impl TerminalPanel {
         Some((point, hit.side))
     }
 
+    /// The active tab's program reads the mouse.
+    fn captures_mouse(&self, cx: &App) -> bool {
+        self.active_tab(cx)
+            .is_some_and(|tab| mouse::captures(tab.emulator.terminal()))
+    }
+
+    /// Report a pointer event at a window position to the active tab's
+    /// program. Ghostty's encoder drops what the program did not ask for.
+    fn report_mouse(
+        &mut self,
+        action: mouse::Action,
+        button: Option<mouse::Button>,
+        position: gpui::Point<Pixels>,
+        mods: &Modifiers,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(geometry) = self.geometry else {
+            return;
+        };
+        let grid = mouse::Grid {
+            cell_w: geometry.cell_w,
+            line_h: geometry.line_h,
+            cols: geometry.cols,
+            rows: geometry.rows,
+        };
+        let at = (
+            f32::from(position.x - geometry.origin.x),
+            f32::from(position.y - geometry.origin.y),
+        );
+        let held = button.is_some() && action != mouse::Action::Release;
+        let chat = self.selected_chat(cx);
+        let Some(tab) = self
+            .chats
+            .get_mut(&chat)
+            .and_then(|tabs| tabs.tabs.get_mut(tabs.active))
+        else {
+            return;
+        };
+        let bytes = tab.mouse.encode(
+            tab.emulator.terminal(),
+            action,
+            button,
+            at,
+            mods,
+            held,
+            grid,
+        );
+        if !bytes.is_empty() {
+            self.queue_input(&bytes, cx);
+        }
+    }
+
     fn on_mouse_down(
         &mut self,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // As in Ghostty: a program that reads the mouse gets every button,
+        // and Shift keeps the mouse here for a selection.
+        let report = !event.modifiers.shift && self.captures_mouse(cx);
+        if event.button != MouseButton::Left && !report {
+            return;
+        }
         window.focus(&self.focus_handle, cx);
+        if report {
+            self.with_active_emulator(cx, |emu| emu.clear_selection());
+            self.selection_drag = None;
+            self.mouse_report = Some(event.button);
+            self.report_mouse(
+                mouse::Action::Press,
+                Some(report_button(event.button)),
+                event.position,
+                &event.modifiers,
+                cx,
+            );
+            cx.notify();
+            return;
+        }
         let Some((point, side)) = self.grid_point_at(event.position, cx) else {
             return;
         };
@@ -1183,6 +1274,31 @@ impl TerminalPanel {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(button) = self.mouse_report {
+            self.report_mouse(
+                mouse::Action::Motion,
+                Some(report_button(button)),
+                event.position,
+                &event.modifiers,
+                cx,
+            );
+            return;
+        }
+        if event.pressed_button.is_none() {
+            // A move with no button goes to a program that asked for
+            // any-event tracking (hover in TUIs), once per cell crossed;
+            // Shift keeps the mouse here, as on a press.
+            if !event.modifiers.shift && self.captures_mouse(cx) {
+                self.report_mouse(
+                    mouse::Action::Motion,
+                    None,
+                    event.position,
+                    &event.modifiers,
+                    cx,
+                );
+            }
+            return;
+        }
         if !event.dragging() {
             return;
         }
@@ -1218,14 +1334,56 @@ impl TerminalPanel {
         self.schedule_selection_scroll(cx);
     }
 
-    fn on_mouse_up(
+    fn on_mouse_up(&mut self, event: &MouseUpEvent, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.mouse_report == Some(event.button) {
+            self.mouse_report = None;
+            self.report_mouse(
+                mouse::Action::Release,
+                Some(report_button(event.button)),
+                event.position,
+                &event.modifiers,
+                cx,
+            );
+        }
+        if event.button == MouseButton::Left {
+            self.selection_drag = None;
+            self.selection_scroll_task = None;
+        }
+    }
+
+    /// Wheel lines (positive: up) at a window position: to a program that
+    /// reads the mouse, as arrow keys on the alternate screen (Ghostty's
+    /// alternate scroll), and through local history otherwise.
+    // ponytail: vertical only; a horizontal wheel (buttons 6/7) when a
+    // program needs it.
+    fn wheel(
         &mut self,
-        _event: &MouseUpEvent,
-        _window: &mut Window,
-        _cx: &mut Context<Self>,
+        lines: i32,
+        position: gpui::Point<Pixels>,
+        mods: &Modifiers,
+        cx: &mut Context<Self>,
     ) {
-        self.selection_drag = None;
-        self.selection_scroll_task = None;
+        if lines == 0 {
+            return;
+        }
+        if self.captures_mouse(cx) {
+            let button = if lines > 0 {
+                mouse::Button::Four
+            } else {
+                mouse::Button::Five
+            };
+            for _ in 0..lines.unsigned_abs() {
+                self.report_mouse(mouse::Action::Press, Some(button), position, mods, cx);
+            }
+            return;
+        }
+        let keys = self
+            .active_tab(cx)
+            .and_then(|tab| mouse::alternate_scroll(tab.emulator.terminal(), lines));
+        match keys {
+            Some(keys) => self.queue_input(&keys, cx),
+            None => self.scroll_active(lines, cx),
+        }
     }
 
     /// Copy the selection. Returns whether anything was copied, so the caller
@@ -1797,14 +1955,21 @@ impl Render for TerminalPanel {
                     .track_focus(&self.focus_handle)
                     .on_hover(cx.listener(Self::on_terminal_hover))
                     .on_key_down(cx.listener(Self::on_key_down))
-                    .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+                    .map(|mut body| {
+                        // Releases are bound on the window too, not just the
+                        // element: a gesture that ends outside the panel
+                        // still has to end, or the next unrelated pointer
+                        // move keeps extending a selection the user let go
+                        // of (and a program never hears the release).
+                        for button in [MouseButton::Left, MouseButton::Right, MouseButton::Middle] {
+                            body = body
+                                .on_mouse_down(button, cx.listener(Self::on_mouse_down))
+                                .on_mouse_up_out(button, cx.listener(Self::on_mouse_up))
+                                .on_mouse_up(button, cx.listener(Self::on_mouse_up));
+                        }
+                        body
+                    })
                     .on_mouse_move(cx.listener(Self::on_mouse_move))
-                    // Bound on the window, not the element: a drag that ends
-                    // outside the panel still has to end the gesture, or the
-                    // next unrelated pointer move keeps extending a selection
-                    // the user let go of.
-                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
-                    .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                         let lines = match event.delta {
                             ScrollDelta::Lines(delta) => delta.y,
@@ -1832,7 +1997,7 @@ impl Render for TerminalPanel {
                         tab.scroll_remainder += lines;
                         let step = tab.scroll_remainder.trunc() as i32;
                         tab.scroll_remainder -= step as f32;
-                        this.scroll_active(step, cx);
+                        this.wheel(step, event.position, &event.modifiers, cx);
                         cx.stop_propagation();
                     }))
                     .child(TerminalElement::new(cx.entity(), focused))
@@ -1932,6 +2097,122 @@ mod tests {
         panel.read_with(cx, |panel, cx| {
             assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 0);
             assert_eq!(panel.active_tab(cx).unwrap().scroll_remainder, 0.75);
+        });
+    }
+
+    /// A program that reads the mouse gets clicks and the wheel; Shift keeps
+    /// the mouse for a selection; on the alternate screen of a program that
+    /// does not read it, the wheel is arrow keys.
+    #[gpui::test]
+    fn a_program_reading_the_mouse_gets_clicks_and_the_wheel(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, ScrollWheelEvent, TouchPhase, point};
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let mut key = 0;
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("chat".into());
+                state
+            });
+            let mut panel = TerminalPanel::new(state, cx);
+            key = panel.reserve_tab_for_chat("chat".into(), "Shell", cx);
+            let tab = panel.tab_mut("chat", key).unwrap();
+            for _ in 0..200 {
+                tab.emulator.feed(b"scrollback\r\n");
+            }
+            tab.emulator.feed(b"\x1b[?1000h\x1b[?1006h");
+            panel
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let g = panel.read_with(cx, |panel, _| panel.geometry.unwrap());
+        // The middle of cell (col 2, row 1).
+        let at = g.origin + point(px(g.cell_w * 2.5), px(g.line_h * 1.5));
+        let sent = |cx: &mut gpui::VisualTestContext| {
+            panel.update(cx, |panel, _| {
+                String::from_utf8(panel.tab_mut("chat", key).unwrap().coalescer.take()).unwrap()
+            })
+        };
+        let press = |cx: &mut gpui::VisualTestContext, button, modifiers: Modifiers| {
+            cx.simulate_event(MouseDownEvent {
+                button,
+                position: at,
+                modifiers,
+                click_count: 1,
+                first_mouse: false,
+            });
+        };
+        let release = |cx: &mut gpui::VisualTestContext, button, position, modifiers| {
+            cx.simulate_event(MouseUpEvent {
+                button,
+                position,
+                modifiers,
+                click_count: 1,
+            });
+        };
+
+        press(cx, MouseButton::Left, Modifiers::default());
+        release(cx, MouseButton::Left, at, Modifiers::default());
+        assert_eq!(sent(cx), "\x1b[<0;3;2M\x1b[<0;3;2m");
+        press(cx, MouseButton::Right, Modifiers::default());
+        release(cx, MouseButton::Right, at, Modifiers::default());
+        assert_eq!(sent(cx), "\x1b[<2;3;2M\x1b[<2;3;2m");
+
+        // Shift+drag selects and tells the program nothing.
+        let shift = Modifiers {
+            shift: true,
+            ..Modifiers::default()
+        };
+        press(cx, MouseButton::Left, shift);
+        let to = at + point(px(g.cell_w * 3.0), px(0.0));
+        cx.simulate_event(MouseMoveEvent {
+            position: to,
+            pressed_button: Some(MouseButton::Left),
+            modifiers: shift,
+        });
+        release(cx, MouseButton::Left, to, shift);
+        assert_eq!(sent(cx), "");
+        panel.read_with(cx, |panel, cx| {
+            assert!(panel.active_tab(cx).unwrap().emulator.has_selection());
+        });
+
+        // The wheel goes to the program, at the pointer's cell, and the
+        // history stays put.
+        let wheel = |cx: &mut gpui::VisualTestContext, lines: f32| {
+            cx.simulate_event(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Lines(point(0.0, lines)),
+                modifiers: Modifiers::default(),
+                touch_phase: TouchPhase::Moved,
+            });
+        };
+        wheel(cx, 2.0);
+        assert_eq!(sent(cx), "\x1b[<64;3;2M\x1b[<64;3;2M");
+        wheel(cx, -1.0);
+        assert_eq!(sent(cx), "\x1b[<65;3;2M");
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 0);
+        });
+
+        // `less`: the alternate screen, no mouse; the wheel is arrow keys.
+        panel.update(cx, |panel, _| {
+            let tab = panel.tab_mut("chat", key).unwrap();
+            tab.emulator.feed(b"\x1b[?1000l\x1b[?1049h");
+        });
+        wheel(cx, 2.0);
+        assert_eq!(sent(cx), "\x1b[A\x1b[A");
+        // Back on the primary screen it scrolls the history.
+        panel.update(cx, |panel, _| {
+            let tab = panel.tab_mut("chat", key).unwrap();
+            tab.emulator.feed(b"\x1b[?1049l");
+        });
+        wheel(cx, 2.0);
+        assert_eq!(sent(cx), "");
+        panel.read_with(cx, |panel, cx| {
+            assert_eq!(panel.active_tab(cx).unwrap().emulator.display_offset(), 2);
         });
     }
 

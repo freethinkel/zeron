@@ -3,6 +3,8 @@
 //!
 //! - [`emulator`] — pure libghostty-vt state machine (bytes in, grid out);
 //! - [`keys`] — keystroke→bytes through Ghostty's key encoder;
+//! - [`mouse`] — pointer→bytes through Ghostty's mouse encoder, and the
+//!   wheel as arrow keys on the alternate screen;
 //! - [`view`] — cell palette, paste encoding, input coalescing, and
 //!   the custom grid-painting element;
 //! - [`panel`] — session-scoped tabs, subscriptions with reconnect backoff,
@@ -15,6 +17,7 @@
 pub(crate) mod dock;
 pub mod emulator;
 pub mod keys;
+pub mod mouse;
 pub mod panel;
 pub mod sprite;
 pub mod view;
