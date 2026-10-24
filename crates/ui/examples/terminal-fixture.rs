@@ -3,6 +3,11 @@
 //! through the real terminal panel, no engine or PTY. Writes
 //! `terminal-dark.png` and `terminal-light.png` to the output directory;
 //! ZERON_FIXTURE_TERMINAL_FONT picks the terminal font.
+//!
+//! ZERON_FIXTURE_PTY=1 renders a real shell instead: the engine's PTY runs
+//! `$SHELL` (your config, your prompt), the fixture types a few commands into
+//! it, and its output reaches the panel as the engine stream would, replies
+//! written back. Writes `pty-dark.png` and `pty-light.png`.
 use gpui::{
     AppContext, AsyncApp, Bounds, Context, Entity, IntoElement, Render, Window, WindowBounds,
     WindowOptions, point, px, size,
@@ -43,13 +48,79 @@ fn sample() -> String {
     lines.join("\r\n")
 }
 
+/// Open `$SHELL` on a real PTY at the panel's grid size, pump its output into
+/// the panel, type [`pty_script`], and wait for it to finish drawing.
+async fn run_shell(
+    terminals: zeron_engine::Terminals,
+    window: gpui::WindowHandle<Fixture>,
+    key: u64,
+    cx: &mut AsyncApp,
+) -> anyhow::Result<()> {
+    use base64::Engine as _;
+    let (cols, rows) = window.update(cx, |fixture, _, cx| {
+        let grid = fixture.0.read(cx).active_grid_snapshot(cx);
+        grid.map_or((80, 24), |g| {
+            (
+                g.lines.first().map_or(80, Vec::len) as u16,
+                g.lines.len() as u16,
+            )
+        })
+    })?;
+    let repo = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .canonicalize()?;
+    let repo = repo.to_str().unwrap_or(".");
+    let session = terminals.open(repo, cols, rows)?;
+    let mut events = terminals.subscribe(&session.id, None)?;
+    let (pump_terminals, id) = (terminals.clone(), session.id.clone());
+    cx.spawn(async move |cx| {
+        while let Some(event) = events.recv().await {
+            let zeron_proto::TerminalEvent::Data { data, .. } = event else {
+                break;
+            };
+            let bytes = base64::engine::general_purpose::STANDARD
+                .decode(data)
+                .unwrap_or_default();
+            let Ok(replies) = window.update(cx, |fixture, _, cx| {
+                fixture
+                    .0
+                    .update(cx, |panel, cx| panel.feed_tab(CHAT, key, &bytes, cx))
+            }) else {
+                break;
+            };
+            if !replies.is_empty() {
+                let _ = pump_terminals.write_bytes(&id, &replies);
+            }
+        }
+    })
+    .detach();
+    // ponytail: fixed waits for the prompt and the output; a busy machine may need longer.
+    cx.background_executor().timer(Duration::from_secs(3)).await;
+    terminals.write_bytes(&session.id, pty_script(repo).as_bytes())?;
+    cx.background_executor().timer(Duration::from_secs(3)).await;
+    Ok(())
+}
+
 async fn pause(cx: &mut AsyncApp) {
     cx.background_executor()
         .timer(Duration::from_millis(300))
         .await;
 }
 
+/// Commands typed into the real shell: colored listings, a git graph, and
+/// text that needs clusters, ligatures and wide cells.
+fn pty_script(repo: &str) -> String {
+    format!(
+        "clear; ls -G {repo}; git -C {repo} log --graph --oneline --decorate --color=always -8; \
+         echo '🇺🇦 👍🏽 👨‍👩‍👧 é ñ -> != 漢字 ╭─╮ ▁▃▅▇'\r"
+    )
+}
+
 fn main() -> anyhow::Result<()> {
+    let runtime = tokio::runtime::Runtime::new()?;
+    let _guard = runtime.enter();
+    let pty = std::env::var_os("ZERON_FIXTURE_PTY").is_some();
+    let terminals = pty.then(zeron_engine::Terminals::new);
     let output = PathBuf::from(std::env::args().nth(1).expect("output directory"));
     std::fs::create_dir_all(&output)?;
     let temp = tempfile::tempdir()?;
@@ -117,14 +188,26 @@ fn main() -> anyhow::Result<()> {
                 let result: anyhow::Result<()> = async {
                     // The first frame sizes the grid; feed after it so nothing reflows.
                     pause(cx).await;
-                    window.update(cx, |fixture, _, cx| {
-                        fixture.0.update(cx, |panel, cx| {
-                            panel.feed_tab(CHAT, key, sample().as_bytes(), cx)
-                        })
-                    })?;
+                    let prefix = if let Some(terminals) = terminals {
+                        run_shell(terminals, window, key, cx).await?;
+                        "pty"
+                    } else {
+                        window.update(cx, |fixture, _, cx| {
+                            fixture.0.update(cx, |panel, cx| {
+                                panel.feed_tab(CHAT, key, sample().as_bytes(), cx)
+                            })
+                        })?;
+                        "terminal"
+                    };
                     for (mode, name) in [
-                        (appearance::AppearanceMode::Dark, "terminal-dark.png"),
-                        (appearance::AppearanceMode::Light, "terminal-light.png"),
+                        (
+                            appearance::AppearanceMode::Dark,
+                            format!("{prefix}-dark.png"),
+                        ),
+                        (
+                            appearance::AppearanceMode::Light,
+                            format!("{prefix}-light.png"),
+                        ),
                     ] {
                         window.update(cx, |_, window, cx| {
                             // The display may restore another size; captures compare at this one.

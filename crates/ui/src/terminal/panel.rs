@@ -555,12 +555,21 @@ impl TerminalPanel {
     }
 
     /// Feed PTY output to a tab directly, as the engine stream would; for
-    /// offscreen fixtures that render a terminal without an engine.
-    pub fn feed_tab(&mut self, chat: &str, key: u64, bytes: &[u8], cx: &mut Context<Self>) {
-        if let Some(tab) = self.tab_mut(chat, key) {
-            tab.emulator.feed(bytes);
-            cx.notify();
-        }
+    /// offscreen fixtures that render a terminal without an engine. Returns
+    /// the terminal's replies (DSR, DA, …) for the caller to write back.
+    pub fn feed_tab(
+        &mut self,
+        chat: &str,
+        key: u64,
+        bytes: &[u8],
+        cx: &mut Context<Self>,
+    ) -> Vec<u8> {
+        let Some(tab) = self.tab_mut(chat, key) else {
+            return Vec::new();
+        };
+        let replies = tab.emulator.feed(bytes);
+        cx.notify();
+        replies
     }
 
     /// Make `key` the rendered tab of the selected chat.
