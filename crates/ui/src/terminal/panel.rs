@@ -1110,6 +1110,11 @@ impl TerminalPanel {
         // current frame, which already paints the resized grid.
     }
 
+    /// Where the grid landed in the last frame.
+    pub fn grid_geometry(&self) -> Option<GridGeometry> {
+        self.geometry
+    }
+
     /// Snapshot for the paint element.
     pub fn active_grid_snapshot(&self, cx: &App) -> Option<GridSnapshot> {
         let tab = self.active_tab(cx)?;

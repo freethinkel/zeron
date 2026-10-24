@@ -8,14 +8,24 @@
 //! `$SHELL` (your config, your prompt), the fixture types a few commands into
 //! it, and its output reaches the panel as the engine stream would, replies
 //! written back. Writes `pty-dark.png` and `pty-light.png`.
+//!
+//! The canned stream also gets `terminal-link-dark.png` and
+//! `terminal-hyperlink-dark.png`: Cmd over a path and over an OSC 8
+//! hyperlink, the whole link underlined.
 use gpui::{
-    AppContext, AsyncApp, Bounds, Context, Entity, IntoElement, Render, Window, WindowBounds,
-    WindowOptions, point, px, size,
+    AppContext, AsyncApp, Bounds, Context, Entity, IntoElement, Modifiers, MouseMoveEvent,
+    PlatformInput, Render, Window, WindowBounds, WindowOptions, point, px, size,
 };
 use std::{path::PathBuf, time::Duration};
 use zeron_ui::*;
 
 const CHAT: &str = "fixture";
+/// The canned row with links, and a cell on its path and on its hyperlink.
+const LINK_ROW: usize = 14;
+const LINK_HOVERS: [(usize, &str); 2] = [
+    (40, "terminal-link-dark.png"),
+    (64, "terminal-hyperlink-dark.png"),
+];
 
 /// The window's root: the panel is drawn as a child, so the capture can
 /// update the window while prepaint updates the panel.
@@ -43,6 +53,7 @@ fn sample() -> String {
         "\x1b[1mStyles\x1b[0m       \x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munder\x1b[0m \x1b[2mdim\x1b[0m \x1b[7minverse\x1b[0m \x1b[9mstrike\x1b[0m \x1b[4:3;58;5;1mcurl\x1b[0m \x1b[38;5;208m208\x1b[0m \x1b[38;2;120;200;255mrgb\x1b[0m \x1b[48;5;236m bg236 \x1b[0m",
         "\x1b[1mANSI\x1b[0m         \x1b[30m██\x1b[31m██\x1b[32m██\x1b[33m██\x1b[34m██\x1b[35m██\x1b[36m██\x1b[37m██\x1b[90m██\x1b[91m██\x1b[92m██\x1b[93m██\x1b[94m██\x1b[95m██\x1b[96m██\x1b[97m██\x1b[0m",
         "\x1b[1mNerd icons\x1b[0m   \u{f07c} \u{e7a8} \u{f418} \u{f02a2} \u{e606} \u{f121} \u{e702}|after",
+        "\x1b[1mLinks\x1b[0m        https://zeron.sh/docs  src/terminal/panel.rs:42  \x1b]8;;https://ghostty.org\x1b\\\x1b[36mGhostty\x1b[0m docs\x1b]8;;\x1b\\",
         "$ codex --yolo && echo done",
     ];
     lines.join("\r\n")
@@ -199,6 +210,51 @@ fn main() -> anyhow::Result<()> {
                         })?;
                         "terminal"
                     };
+                    for (col, name) in LINK_HOVERS.iter().filter(|_| prefix == "terminal") {
+                        // Cmd over a link on the links row, in the first (dark)
+                        // appearance: a switch back from light would still be
+                        // fading in.
+                        let position = window.update(cx, |fixture, window, cx| {
+                            window.resize(size(px(980.0), px(380.0)));
+                            let g = fixture.0.read(cx).grid_geometry().expect("drawn grid");
+                            g.origin
+                                + point(
+                                    px(g.cell_w * (*col as f32 + 0.5)),
+                                    px(g.line_h * (LINK_ROW as f32 + 0.5)),
+                                )
+                        })?;
+                        pause(cx).await;
+                        let any: gpui::AnyWindowHandle = window.into();
+                        any.update(cx, |_, window, cx| -> anyhow::Result<()> {
+                            window.dispatch_event(
+                                PlatformInput::MouseMove(MouseMoveEvent {
+                                    position,
+                                    pressed_button: None,
+                                    modifiers: Modifiers {
+                                        platform: cfg!(target_os = "macos"),
+                                        control: !cfg!(target_os = "macos"),
+                                        ..Modifiers::default()
+                                    },
+                                }),
+                                cx,
+                            );
+                            window.draw(cx).clear();
+                            window.render_to_image()?.save(output.join(name))?;
+                            Ok(())
+                        })??;
+                    }
+                    if prefix == "terminal" {
+                        let any: gpui::AnyWindowHandle = window.into();
+                        any.update(cx, |_, window, cx| {
+                            window.dispatch_event(
+                                PlatformInput::ModifiersChanged(gpui::ModifiersChangedEvent {
+                                    modifiers: Modifiers::default(),
+                                    capslock: Default::default(),
+                                }),
+                                cx,
+                            )
+                        })?;
+                    }
                     for (mode, name) in [
                         (
                             appearance::AppearanceMode::Dark,
