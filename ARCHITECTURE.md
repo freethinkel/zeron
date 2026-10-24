@@ -222,7 +222,8 @@ feature spec `docs/research/feature-inventory.md` §1.
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade.
 - **Terminal**: Ghostty's libghostty-vt (`ghostty-vt`, built with Zig 0.16, MIT) + `portable-pty`
-  on the engine side; custom gpui grid element; tabs w/ drag-reorder (150ms sliding transforms),
+  on the engine side; custom gpui grid element (glyphs pinned to their cells' columns, ligatures
+  on, Ghostty's sprite glyphs); tabs w/ drag-reorder (150ms sliding transforms),
   height drag 160px–55vh, 12ms input coalescing / 80ms resize debounce, 1MB replay, detach ≠ close.
 - **Diff pane**: unified-patch parser → virtualized file/hunk/line rows, per-file collapse
   (180ms height tween), time-sliced highlight, 200ms width transition on the pane itself.

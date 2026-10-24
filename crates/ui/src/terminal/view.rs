@@ -7,18 +7,24 @@
 //! - [`TerminalElement`] — a custom gpui element that measures cell metrics
 //!   from the real mono font (the "font probe"), reports the resulting
 //!   cols×rows back to the panel, and paints the grid: background quads for
-//!   non-default cells, one `ShapedLine` per row (same font whatever the
-//!   colors — paint never changes layout), and the cursor block.
+//!   non-default cells, shaped segments whose glyphs sit on their cells'
+//!   columns (ligatures on, see [`shape_row`]), Ghostty's sprite glyphs for
+//!   box drawing, blocks and Powerline, and the cursor block.
+
+use std::collections::HashMap;
+use std::sync::Arc;
 
 use gpui::{
-    App, Bounds, Entity, GlobalElementId, Hsla, LayoutId, PaintQuad, Pixels, ShapedLine,
-    SharedString, Style, TextRun, Window, fill, font, outline, point, px, relative, size,
+    App, Bounds, Entity, GlobalElementId, Hsla, LayoutId, PaintQuad, Pixels, RenderImage,
+    ShapedLine, SharedString, Style, TextRun, Window, fill, font, outline, point, px, relative,
+    size,
 };
 
 use crate::theme::{Appearance, Theme, rgb_to_hsl};
 
 use super::emulator::{CellColor, CellSnapshot, Side};
 use super::panel::TerminalPanel;
+use super::sprite;
 
 /// Default terminal font metrics; the rendered values come from the theme.
 pub const TERM_FONT_SIZE: f32 = 13.0;
@@ -26,6 +32,12 @@ pub const TERM_LINE_HEIGHT: f32 = 18.0;
 /// Line height as a multiple of the font size, so a user-chosen size keeps the
 /// default's row rhythm.
 const TERM_LINE_HEIGHT_RATIO: f32 = TERM_LINE_HEIGHT / TERM_FONT_SIZE;
+// ponytail: a fixed list of common Nerd Font families; a setting when someone uses another.
+const NERD_FALLBACKS: [&str; 3] = [
+    "Symbols Nerd Font Mono",
+    "IoskeleyMonoNL Nerd Font Mono",
+    "FiraCode Nerd Font Mono",
+];
 /// Inner padding of the grid area.
 pub const TERM_PADDING: f32 = 12.0;
 
@@ -263,12 +275,19 @@ pub struct TerminalPrepaint {
     /// Per row, the shaped segments and the grid COLUMN each one starts at.
     /// Not one line per row: see [`shape_row`].
     lines: Vec<Vec<(usize, ShapedLine)>>,
+    /// Per row, the cells drawn by [`sprite`] instead of the font.
+    glyphs: Vec<Vec<CustomGlyph>>,
+    /// Light line width for sprite glyphs, in logical pixels.
+    stroke: f32,
     /// Grid cell advance, so paint can place segments by column.
     cell_w: Pixels,
     /// Grid row height, so paint places rows on the same baselines prepaint
     /// measured the grid with.
     line_h: Pixels,
     cursor: Option<PaintQuad>,
+    /// The focused block cursor is opaque, so it goes under the text (whose
+    /// cell flips to the background color); the unfocused outline goes over.
+    cursor_under_text: bool,
 }
 
 impl gpui::IntoElement for TerminalElement {
@@ -313,21 +332,15 @@ impl gpui::Element for TerminalElement {
         cx: &mut App,
     ) -> Self::PrepaintState {
         let theme = Theme::of(cx).clone();
-        // Ligatures OFF. A terminal is a fixed grid: the shaper must emit one
-        // cell-width advance per character, and a contextual substitution
-        // (Geist Mono ligates `--`, `->`, …) collapses several cells into
-        // fewer glyphs, so the row renders SHORT while the cursor — a quad at
-        // `cell_w * col` — stays on the true column. That is the `codex
-        // --yolo` → `codex--yolo` report: the space is in the grid and went
-        // to the pty (the command runs), only the painted run lost a cell.
-        // The landing page disables the same three features on its ASCII art
-        // for the same reason.
+        // Ligatures stay on: `shape_row` puts every glyph back on its cell's
+        // column, so a ligature narrower than its cells no longer pulls the
+        // rest of the row off the grid.
         let mut mono = font(theme.font_terminal.clone());
-        mono.features = gpui::FontFeatures(std::sync::Arc::new(vec![
-            ("liga".into(), 0),
-            ("calt".into(), 0),
-            ("dlig".into(), 0),
-        ]));
+        // Nerd Font icons (eza, prompts) are missing from Geist Mono; borrow
+        // them from installed Nerd Fonts.
+        mono.fallbacks = Some(gpui::FontFallbacks::from_fonts(
+            NERD_FALLBACKS.iter().map(|f| f.to_string()).collect(),
+        ));
         // Font probe: measure the actual advance of the resolved mono font so
         // cols/rows track real glyph metrics, not a guessed aspect ratio.
         let font_size = px(theme.terminal_font_size);
@@ -368,15 +381,29 @@ impl gpui::Element for TerminalElement {
                 bg_quads: Vec::new(),
                 sel_quads: Vec::new(),
                 lines: Vec::new(),
+                glyphs: Vec::new(),
+                stroke: 1.0,
                 cell_w,
                 line_h,
                 cursor: None,
+                cursor_under_text: false,
             };
         };
 
         let mut bg_quads = Vec::new();
         let mut sel_quads = Vec::new();
         let mut lines = Vec::with_capacity(snapshot.lines.len());
+        let mut glyphs = Vec::with_capacity(snapshot.lines.len());
+        // Ghostty's block cursor: the cell's text takes the background color.
+        let block_cursor = snapshot
+            .cursor
+            .as_ref()
+            .filter(|_| self.focused)
+            .map(|c| (c.row, c.col));
+        let cursor_text = Hsla {
+            a: 1.0,
+            ..theme.terminal.background
+        };
 
         for (row_ix, row) in snapshot.lines.iter().enumerate() {
             let y = origin.y + line_h * row_ix as f32;
@@ -427,7 +454,21 @@ impl gpui::Element for TerminalElement {
                     _ => {}
                 }
             }
-            lines.push(shape_row(row, &theme, &mono, font_size, window));
+            let mut row_glyphs = Vec::new();
+            let cursor_col = block_cursor
+                .filter(|&(r, _)| r == row_ix)
+                .map(|(_, c)| (c, cursor_text));
+            lines.push(shape_row(
+                row,
+                &theme,
+                &mono,
+                font_size,
+                cell_w,
+                cursor_col,
+                &mut row_glyphs,
+                window,
+            ));
+            glyphs.push(row_glyphs);
         }
 
         let cursor = snapshot.cursor.map(|c| {
@@ -439,10 +480,13 @@ impl gpui::Element for TerminalElement {
                 size(cell_w, line_h),
             );
             if self.focused {
-                // Translucent block: the glyph underneath stays legible.
-                fill(cursor_bounds, theme.cursor)
+                fill(cursor_bounds, cursor_color(&theme))
             } else {
-                outline(cursor_bounds, theme.cursor, gpui::BorderStyle::Solid)
+                outline(
+                    cursor_bounds,
+                    cursor_color(&theme),
+                    gpui::BorderStyle::Solid,
+                )
             }
         });
 
@@ -450,9 +494,15 @@ impl gpui::Element for TerminalElement {
             bg_quads,
             sel_quads,
             lines,
+            glyphs,
+            // The font's underline thickness is ~0.05em; Ghostty strokes box
+            // lines with it. ponytail: gpui doesn't expose the real metric, so
+            // approximate it.
+            stroke: theme.terminal_font_size * 0.05,
             cell_w,
             line_h,
             cursor,
+            cursor_under_text: self.focused,
         }
     }
 
@@ -478,6 +528,11 @@ impl gpui::Element for TerminalElement {
             for quad in prepaint.sel_quads.drain(..) {
                 window.paint_quad(quad);
             }
+            if prepaint.cursor_under_text
+                && let Some(cursor) = prepaint.cursor.take()
+            {
+                window.paint_quad(cursor);
+            }
             let cell_w = prepaint.cell_w;
             for (ix, segments) in prepaint.lines.iter().enumerate() {
                 let y = origin.y + line_h * ix as f32;
@@ -492,6 +547,17 @@ impl gpui::Element for TerminalElement {
                     );
                 }
             }
+            for (ix, row) in prepaint.glyphs.iter().enumerate() {
+                let y = origin.y + line_h * ix as f32;
+                for glyph in row {
+                    let left = origin.x + cell_w * glyph.col as f32;
+                    let bounds = Bounds::from_corners(
+                        point(left, y),
+                        point(left + cell_w * glyph.cells as f32, y + line_h),
+                    );
+                    paint_custom_glyph(glyph, bounds, prepaint.stroke, window, cx);
+                }
+            }
             if let Some(cursor) = prepaint.cursor.take() {
                 window.paint_quad(cursor);
             }
@@ -499,88 +565,90 @@ impl gpui::Element for TerminalElement {
     }
 }
 
-/// Shape one grid row into COLUMN-PINNED segments.
+/// The cursor block, opaque as Ghostty draws it: the theme's accent.
+fn cursor_color(theme: &Theme) -> Hsla {
+    Hsla {
+        a: 1.0,
+        ..theme.accent
+    }
+}
+
+/// Shape one grid row into segments placed by column.
 ///
 /// A terminal is a fixed grid, but a shaped line places glyphs by their font
-/// advances. Those agree only while every glyph is monospace-width — the row's
-/// `cell_w` IS the mono font's em advance. The moment a glyph resolves through
-/// FONT FALLBACK (box drawing `│─╭`, arrows `→`, emoji, CJK) its advance is
-/// whatever that other font uses, and the whole rest of the line slides out of
-/// the grid: box borders land a few pixels off (user report: "one of the pipes
-/// is broken"), and a double-width glyph whose fallback advances only one cell
-/// swallows the column after it (user report: `codex --yolo` rendering as
-/// `codex--yolo`). Backgrounds, selection and the cursor never drifted because
-/// those are quads placed at `cell_w * col`.
+/// advances, and those drift off it: a glyph from FONT FALLBACK (arrows `→`,
+/// emoji, CJK) advances by whatever its own font says, and a ligature (Geist
+/// Mono's `--`, `->`) covers several cells with one narrower glyph. Laid out
+/// as shaped, the rest of the row slides (user reports: "one of the pipes is
+/// broken", `codex --yolo` rendering as `codex--yolo`), while backgrounds,
+/// selection and the cursor stay put as quads at `cell_w * col`.
 ///
-/// So: runs of ASCII shape together (guaranteed cell-width in a mono font),
-/// and every other glyph is its own segment pinned at its own column. Wide
-/// spacers are still skipped — the wide glyph covers both columns, and the
-/// NEXT segment re-pins regardless.
+/// So, as Ghostty, kitty and WezTerm do, every glyph moves to the column of
+/// the cell it came from (its cluster): a glyph narrower than its cells leaves
+/// a gap, and nothing after it slides. Own segments remain only for sprite
+/// glyphs (drawn by paint), right-to-left runs (CoreText reorders and joins
+/// their glyphs, so they cannot be placed letter by letter) and the cursor
+/// cell, which splits a ligature under the cursor as Ghostty does.
+#[allow(clippy::too_many_arguments)]
 fn shape_row(
     row: &[CellSnapshot],
     theme: &Theme,
     mono: &gpui::Font,
     font_size: Pixels,
+    cell_w: Pixels,
+    cursor: Option<(usize, Hsla)>,
+    glyphs: &mut Vec<CustomGlyph>,
     window: &Window,
 ) -> Vec<(usize, ShapedLine)> {
-    fn flush(
-        segments: &mut Vec<(usize, ShapedLine)>,
-        text: &mut String,
-        runs: &mut Vec<TextRun>,
-        seg_col: usize,
-        font_size: Pixels,
-        window: &Window,
-    ) {
-        if text.is_empty() {
-            return;
-        }
-        let shaped = window.text_system().shape_line(
-            SharedString::from(std::mem::take(text)),
-            font_size,
-            runs,
-            None,
-        );
-        segments.push((seg_col, shaped));
-        runs.clear();
-    }
-
     let mut segments: Vec<(usize, ShapedLine)> = Vec::new();
-    let mut text = String::with_capacity(row.len());
-    let mut runs: Vec<TextRun> = Vec::new();
-    let mut seg_col = 0usize;
+    let mut seg = Segment::default();
+    let mut rtl_run = false;
 
     for (col, cell) in row.iter().enumerate() {
         if cell.wide_spacer {
             continue;
         }
         let ch = if cell.hidden { ' ' } else { cell.ch };
-        // Anything that can leave the mono font gets its own pinned segment.
-        let pinned = !ch.is_ascii() || cell.wide;
-        if pinned {
-            flush(
-                &mut segments,
-                &mut text,
-                &mut runs,
-                seg_col,
-                font_size,
-                window,
-            );
-        }
-        if text.is_empty() {
-            seg_col = col;
-        }
         let (fg, _) = cell.display_colors();
         let mut color = resolve_color(fg, theme);
         if cell.dim {
             color.a *= 0.6;
         }
-        let mut cell_font = mono.clone();
-        cell_font.weight = if cell.bold {
+        let at_cursor = cursor.is_some_and(|(c, _)| c == col);
+        if let Some((_, cursor_text)) = cursor.filter(|_| at_cursor) {
+            color = cursor_text;
+        }
+        // An RTL run ending here fits into the cells it spans.
+        let rtl_fit = rtl_run.then(|| cell_w * (col - seg.col) as f32);
+        if !ch.is_ascii() && sprite::has_char(ch) {
+            // Drawn to the cell by paint, not shaped.
+            seg.flush(rtl_fit, &mut segments, font_size, cell_w, window);
+            rtl_run = false;
+            glyphs.push(CustomGlyph {
+                col,
+                ch,
+                cells: if cell.wide { 2 } else { 1 },
+                color,
+            });
+            continue;
+        }
+        // Arabic/Hebrew letters (and the spaces between them) shape as ONE
+        // segment: alone, each letter gets its isolated form and the words
+        // read left to right; together CoreText joins and reorders them.
+        let rtl = is_rtl(ch) && !cell.wide;
+        let joins = rtl_run && (rtl || ch == ' ');
+        if !joins && (at_cursor || rtl || rtl_run) {
+            seg.flush(rtl_fit, &mut segments, font_size, cell_w, window);
+        }
+        if seg.text.is_empty() {
+            seg.col = col;
+        }
+        let weight = if cell.bold {
             gpui::FontWeight::BOLD
         } else {
             gpui::FontWeight::NORMAL
         };
-        cell_font.style = if cell.italic {
+        let style = if cell.italic {
             gpui::FontStyle::Italic
         } else {
             gpui::FontStyle::Normal
@@ -590,43 +658,205 @@ fn shape_row(
             thickness: px(1.0),
             wavy: false,
         });
-        let len = ch.len_utf8();
-        text.push(ch);
-        match runs.last_mut() {
+        // A cell's whole grapheme cluster (a flag, a skin tone, a letter and
+        // its marks) shapes together, on its column.
+        let mut buf = [0; 4];
+        let text = cell
+            .cluster
+            .as_deref()
+            .filter(|_| !cell.hidden)
+            .unwrap_or_else(|| ch.encode_utf8(&mut buf));
+        let len = text.len();
+        seg.text.push_str(text);
+        seg.cols.extend(std::iter::repeat_n(col, len));
+        // Every run is `mono` but for weight and style: comparing those spares
+        // a font clone and compare per cell.
+        match seg.runs.last_mut() {
             Some(last)
-                if last.color == color && last.font == cell_font && last.underline == underline =>
+                if last.color == color
+                    && last.font.weight == weight
+                    && last.font.style == style
+                    && last.underline == underline =>
             {
                 last.len += len;
             }
-            _ => runs.push(TextRun {
+            _ => seg.runs.push(TextRun {
                 len,
-                font: cell_font,
+                font: gpui::Font {
+                    weight,
+                    style,
+                    ..mono.clone()
+                },
                 color,
                 background_color: None,
                 underline,
                 strikethrough: None,
             }),
         }
-        if pinned {
-            flush(
-                &mut segments,
-                &mut text,
-                &mut runs,
-                seg_col,
-                font_size,
-                window,
-            );
+        rtl_run = rtl || joins;
+        if at_cursor && !rtl_run {
+            seg.flush(None, &mut segments, font_size, cell_w, window);
         }
     }
-    flush(
-        &mut segments,
-        &mut text,
-        &mut runs,
-        seg_col,
-        font_size,
-        window,
-    );
+    let rtl_fit = rtl_run.then(|| cell_w * (row.len() - seg.col) as f32);
+    seg.flush(rtl_fit, &mut segments, font_size, cell_w, window);
     segments
+}
+
+/// The row text being gathered into one shaped segment, with the grid column
+/// of each of its bytes.
+#[derive(Default)]
+struct Segment {
+    text: String,
+    cols: Vec<usize>,
+    runs: Vec<TextRun>,
+    col: usize,
+}
+
+impl Segment {
+    /// Shape the gathered text into `out`. `rtl_fit` marks a right-to-left
+    /// run and the width of its cells.
+    fn flush(
+        &mut self,
+        rtl_fit: Option<Pixels>,
+        out: &mut Vec<(usize, ShapedLine)>,
+        font_size: Pixels,
+        cell_w: Pixels,
+        window: &Window,
+    ) {
+        if self.text.is_empty() {
+            return;
+        }
+        let text = SharedString::from(std::mem::take(&mut self.text));
+        let system = window.text_system();
+        let mut shaped = system.shape_line(text.clone(), font_size, &self.runs, None);
+        match rtl_fit {
+            // A joined RTL run wider than its cells shrinks to fit them.
+            // Spacing glyphs apart instead would break the joins between
+            // letters.
+            // ponytail: narrower runs stay as they are; Arabic stretches with
+            // kashida (U+0640), not by spacing.
+            Some(fit) if shaped.width > fit => {
+                shaped =
+                    system.shape_line(text, font_size * (fit / shaped.width), &self.runs, None);
+            }
+            Some(_) => {}
+            None => snap_to_cells(&mut shaped, &self.cols, self.col, cell_w),
+        }
+        out.push((self.col, shaped));
+        self.runs.clear();
+        self.cols.clear();
+    }
+}
+
+/// Move every glyph of `line` to the column its cluster starts at. Glyphs of
+/// one cluster (a letter and its combining marks) keep their offsets from the
+/// cluster's first glyph.
+fn snap_to_cells(line: &mut ShapedLine, cols: &[usize], seg_col: usize, cell_w: Pixels) {
+    let mut runs = line.runs.clone();
+    let mut cluster = (usize::MAX, px(0.));
+    for glyph in runs.iter_mut().flat_map(|run| run.glyphs.iter_mut()) {
+        // A combining mark is its own glyph at its own index, but on its
+        // letter's column.
+        let col = cols.get(glyph.index).copied().unwrap_or(seg_col);
+        if col != cluster.0 {
+            cluster = (col, glyph.position.x);
+        }
+        glyph.position.x = cell_w * (col - seg_col) as f32 + (glyph.position.x - cluster.1);
+    }
+    **line = Arc::new(gpui::LineLayout {
+        font_size: line.font_size,
+        width: line.width,
+        ascent: line.ascent,
+        descent: line.descent,
+        runs,
+        len: line.len,
+    });
+}
+
+/// Hebrew and Arabic blocks (letters, marks, presentation forms).
+fn is_rtl(ch: char) -> bool {
+    matches!(ch, '\u{0590}'..='\u{08FF}' | '\u{FB1D}'..='\u{FDFF}' | '\u{FE70}'..='\u{FEFC}')
+}
+
+struct CustomGlyph {
+    col: usize,
+    ch: char,
+    cells: usize,
+    color: Hsla,
+}
+
+/// Drawn sprite glyphs, keyed by char, device-pixel cell size, line thickness
+/// and color (images are full color, so the color is baked in).
+#[derive(Default)]
+struct CustomGlyphCache(HashMap<(char, u32, u32, u32, [u8; 4]), (Arc<RenderImage>, u32, u32)>);
+
+impl gpui::Global for CustomGlyphCache {}
+
+/// Paint one sprite glyph drawn at the exact device-pixel size of its cell, so
+/// neighbouring cells tile without seams or resampling. The sprite is padded
+/// on every side (a glyph may spill past its cell), so it is placed up-left of
+/// the cell by the padding.
+fn paint_custom_glyph(
+    glyph: &CustomGlyph,
+    bounds: Bounds<Pixels>,
+    stroke: f32,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let scale = window.scale_factor();
+    let device = |v: Pixels| (f32::from(v) * scale).round();
+    let (left, top) = (device(bounds.left()), device(bounds.top()));
+    let w = (device(bounds.right()) - left) as u32;
+    let h = (device(bounds.bottom()) - top) as u32;
+    let thickness = (stroke * scale).ceil().max(1.0) as u32;
+    let rgba = gpui::Rgba::from(glyph.color);
+    let color = [rgba.r, rgba.g, rgba.b, rgba.a].map(|c| (c * 255.0).round() as u8);
+    let key = (glyph.ch, w, h, thickness, color);
+
+    let cache = cx.default_global::<CustomGlyphCache>();
+    let (image, pad_x, pad_y) = match cache.0.get(&key) {
+        Some(hit) => hit.clone(),
+        None => {
+            let metrics = sprite::Metrics {
+                cell_width: w / glyph.cells as u32,
+                cell_height: h,
+                box_thickness: thickness,
+            };
+            let Some(drawn) = sprite::render(glyph.ch, w, h, &metrics) else {
+                return;
+            };
+            // Coverage → straight-alpha BGRA in the glyph color.
+            let [r, g, b, a] = color;
+            let bgra: Vec<u8> = drawn
+                .alpha
+                .iter()
+                .flat_map(|&cov| [b, g, r, (cov as u16 * a as u16 / 255) as u8])
+                .collect();
+            let Some(buffer) = image::RgbaImage::from_raw(drawn.width, drawn.height, bgra) else {
+                return;
+            };
+            let image = Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]));
+            // ponytail: drop everything past a cap (old sizes after a zoom,
+            // truecolor gradients); an LRU if that ever thrashes. Images live
+            // in this window's atlas, so other windows may keep stale copies.
+            if cache.0.len() >= 4096 {
+                for (_, (old, _, _)) in cache.0.drain() {
+                    let _ = window.drop_image(old);
+                }
+            }
+            let hit = (image, drawn.padding_x, drawn.padding_y);
+            cache.0.insert(key, hit.clone());
+            hit
+        }
+    };
+    let size = image.size(0);
+    let logical = |v: f32| px(v / scale);
+    let bounds = Bounds::new(
+        point(logical(left - pad_x as f32), logical(top - pad_y as f32)),
+        gpui::size(logical(size.width.0 as f32), logical(size.height.0 as f32)),
+    );
+    let _ = window.paint_image(bounds, Default::default(), image, 0, false);
 }
 
 #[cfg(test)]
@@ -843,5 +1073,32 @@ mod tests {
     #[test]
     fn drag_threshold_matches_the_gpui_default() {
         assert_eq!(SELECTION_DRAG_THRESHOLD, 2.0);
+    }
+
+    #[test]
+    fn glyphs_snap_to_their_cluster_column() {
+        let glyph = |index, x: f32| gpui::ShapedGlyph {
+            id: gpui::GlyphId(0),
+            position: point(px(x), px(0.)),
+            index,
+            is_emoji: false,
+        };
+        // `->x` from col 3: a ligature 7px wide for `->`, a combining mark 2px
+        // into its base `x`.
+        let mut line = ShapedLine::default();
+        *line = Arc::new(gpui::LineLayout {
+            runs: vec![gpui::ShapedRun {
+                font_id: gpui::FontId(0),
+                glyphs: vec![glyph(0, 0.), glyph(2, 7.), glyph(2, 9.)],
+            }],
+            ..Default::default()
+        });
+        snap_to_cells(&mut line, &[3, 4, 5, 5], 3, px(10.));
+        let xs: Vec<f32> = line.runs[0]
+            .glyphs
+            .iter()
+            .map(|g| f32::from(g.position.x))
+            .collect();
+        assert_eq!(xs, [0., 20., 22.]);
     }
 }

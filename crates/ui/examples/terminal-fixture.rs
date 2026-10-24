@@ -1,7 +1,8 @@
 //! Offscreen terminal render: a canned ANSI stream (box drawing, blocks,
 //! braille, Powerline, ligatures, emoji clusters, combining marks, CJK, RTL)
 //! through the real terminal panel, no engine or PTY. Writes
-//! `terminal-dark.png` and `terminal-light.png` to the output directory.
+//! `terminal-dark.png` and `terminal-light.png` to the output directory;
+//! ZERON_FIXTURE_TERMINAL_FONT picks the terminal font.
 use gpui::{
     AppContext, AsyncApp, Bounds, Context, Entity, IntoElement, Render, Window, WindowBounds,
     WindowOptions, point, px, size,
@@ -57,7 +58,12 @@ fn main() -> anyhow::Result<()> {
         .with_assets(icons::Assets)
         .run(move |cx| {
             gpui_base::init(cx);
-            let prefs = settings::UiSettings::default();
+            let mut prefs = settings::UiSettings::default();
+            // ZERON_FIXTURE_TERMINAL_FONT=<family>: render in an installed font,
+            // e.g. one with ligatures (Geist Mono has none).
+            if let Ok(family) = std::env::var("ZERON_FIXTURE_TERMINAL_FONT") {
+                prefs.terminal_font_family = typography::UiFontFamily::Installed(family);
+            }
             settings::init(prefs.clone(), data.clone(), cx);
             let fonts = typography::register_fonts(cx);
             typography::init(
@@ -120,7 +126,11 @@ fn main() -> anyhow::Result<()> {
                         (appearance::AppearanceMode::Dark, "terminal-dark.png"),
                         (appearance::AppearanceMode::Light, "terminal-light.png"),
                     ] {
-                        window.update(cx, |_, _, cx| appearance::set_mode(mode, cx))?;
+                        window.update(cx, |_, window, cx| {
+                            // The display may restore another size; captures compare at this one.
+                            window.resize(size(px(980.0), px(380.0)));
+                            appearance::set_mode(mode, cx)
+                        })?;
                         pause(cx).await;
                         // Untyped, so the root view is not leased while it draws.
                         let any: gpui::AnyWindowHandle = window.into();
