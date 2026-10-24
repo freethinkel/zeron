@@ -14068,6 +14068,7 @@ dependencies = [
  "fontdb",
  "foreign-types 0.5.0",
  "futures",
+ "ghostty-vt",
  "gpui",
  "gpui-base",
  "gpui_platform",
