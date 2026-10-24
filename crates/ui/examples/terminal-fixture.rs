@@ -40,7 +40,7 @@ fn sample() -> String {
         "\x1b[1mEmoji\x1b[0m        🇺🇦 🇯🇵 👍🏽 👩🏾‍💻 👨‍👩‍👧 1️⃣ #️⃣ ❤️ ✅ 🚀|after",
         "\x1b[1mCombining\x1b[0m    e\u{301} n\u{303} a\u{308} o\u{302}\u{323} Z\u{335}a\u{336}|after",
         "\x1b[1mCJK\x1b[0m          漢字テスト한국어|after  \x1b[1mRTL\x1b[0m مرحبا بالعالم · שלום עולם|after",
-        "\x1b[1mStyles\x1b[0m       \x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munder\x1b[0m \x1b[2mdim\x1b[0m \x1b[7minverse\x1b[0m \x1b[9mstrike\x1b[0m \x1b[38;5;208m208\x1b[0m \x1b[38;2;120;200;255mrgb\x1b[0m \x1b[48;5;236m bg236 \x1b[0m",
+        "\x1b[1mStyles\x1b[0m       \x1b[1mbold\x1b[0m \x1b[3mitalic\x1b[0m \x1b[4munder\x1b[0m \x1b[2mdim\x1b[0m \x1b[7minverse\x1b[0m \x1b[9mstrike\x1b[0m \x1b[4:3;58;5;1mcurl\x1b[0m \x1b[38;5;208m208\x1b[0m \x1b[38;2;120;200;255mrgb\x1b[0m \x1b[48;5;236m bg236 \x1b[0m",
         "\x1b[1mANSI\x1b[0m         \x1b[30m██\x1b[31m██\x1b[32m██\x1b[33m██\x1b[34m██\x1b[35m██\x1b[36m██\x1b[37m██\x1b[90m██\x1b[91m██\x1b[92m██\x1b[93m██\x1b[94m██\x1b[95m██\x1b[96m██\x1b[97m██\x1b[0m",
         "\x1b[1mNerd icons\x1b[0m   \u{f07c} \u{e7a8} \u{f418} \u{f02a2} \u{e606} \u{f121} \u{e702}|after",
         "$ codex --yolo && echo done",

@@ -95,6 +95,12 @@ pub struct CellSnapshot {
     pub dim: bool,
     pub italic: bool,
     pub underline: bool,
+    /// The underline is curly (SGR 4:3): spelling and diagnostics.
+    // ponytail: double, dotted and dashed underlines draw as a single line.
+    pub undercurl: bool,
+    /// SGR 58; `None` underlines in the text's color.
+    pub underline_color: Option<CellColor>,
+    pub strikethrough: bool,
     pub inverse: bool,
     pub hidden: bool,
     /// A double-width char (occupies this cell plus the next spacer cell).
@@ -493,6 +499,12 @@ impl Emulator {
                         dim: style.faint,
                         italic: style.italic,
                         underline: style.underline != Underline::None,
+                        undercurl: style.underline == Underline::Curly,
+                        underline_color: match style.underline_color {
+                            StyleColor::None => None,
+                            color => Some(map_color(color, CellColor::Foreground)),
+                        },
+                        strikethrough: style.strikethrough,
                         inverse: style.inverse,
                         hidden: style.invisible,
                         wide: wide == CellWide::Wide,
@@ -650,6 +662,21 @@ mod tests {
         assert_eq!(line[0].fg, CellColor::Indexed(13)); // bright magenta
         assert_eq!(line[1].fg, CellColor::Indexed(196));
         assert_eq!(line[2].fg, CellColor::Rgb(10, 20, 30));
+    }
+
+    /// Neovim's diagnostics: an undercurl in its own color (SGR 4:3, 58),
+    /// and strikethrough for deprecated names (SGR 9).
+    #[test]
+    fn strikethrough_undercurl_and_underline_color() {
+        let mut e = emu(20, 2);
+        e.feed(b"\x1b[9mS\x1b[0m\x1b[4:3;58;2;1;2;3mC\x1b[0m\x1b[4mU\x1b[0m");
+        let line = e.line(0);
+        assert!(line[0].strikethrough && !line[0].underline);
+        assert!(line[1].underline && line[1].undercurl);
+        assert_eq!(line[1].underline_color, Some(CellColor::Rgb(1, 2, 3)));
+        assert!(line[2].underline && !line[2].undercurl);
+        assert_eq!(line[2].underline_color, None);
+        assert!(!line[3].strikethrough && !line[3].underline);
     }
 
     #[test]

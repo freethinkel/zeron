@@ -654,9 +654,17 @@ fn shape_row(
             gpui::FontStyle::Normal
         };
         let underline = cell.underline.then_some(gpui::UnderlineStyle {
+            color: Some(
+                cell.underline_color
+                    .filter(|_| !at_cursor)
+                    .map_or(color, |c| resolve_color(c, theme)),
+            ),
+            thickness: px(1.0),
+            wavy: cell.undercurl,
+        });
+        let strikethrough = cell.strikethrough.then_some(gpui::StrikethroughStyle {
             color: Some(color),
             thickness: px(1.0),
-            wavy: false,
         });
         // A cell's whole grapheme cluster (a flag, a skin tone, a letter and
         // its marks) shapes together, on its column.
@@ -676,7 +684,8 @@ fn shape_row(
                 if last.color == color
                     && last.font.weight == weight
                     && last.font.style == style
-                    && last.underline == underline =>
+                    && last.underline == underline
+                    && last.strikethrough == strikethrough =>
             {
                 last.len += len;
             }
@@ -690,7 +699,7 @@ fn shape_row(
                 color,
                 background_color: None,
                 underline,
-                strikethrough: None,
+                strikethrough,
             }),
         }
         rtl_run = rtl || joins;
