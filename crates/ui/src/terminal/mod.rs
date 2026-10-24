@@ -1,8 +1,9 @@
 //! Terminal panel (feature-inventory §1.10): a libghostty-vt-backed
 //! emulator fed by the engine's PTY stream over the generic RPC client.
 //!
-//! - [`emulator`] — pure Term + vte state machine (bytes in, grid out);
-//! - [`view`] — cell palette, keystroke→bytes encoding, input coalescing, and
+//! - [`emulator`] — pure libghostty-vt state machine (bytes in, grid out);
+//! - [`keys`] — keystroke→bytes through Ghostty's key encoder;
+//! - [`view`] — cell palette, paste encoding, input coalescing, and
 //!   the custom grid-painting element;
 //! - [`panel`] — session-scoped tabs, subscriptions with reconnect backoff,
 //!   drag-reorder, and the Cmd/Ctrl+J toggle action.
@@ -13,6 +14,7 @@
 
 pub(crate) mod dock;
 pub mod emulator;
+pub mod keys;
 pub mod panel;
 pub mod sprite;
 pub mod view;

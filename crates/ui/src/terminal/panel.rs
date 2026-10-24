@@ -34,9 +34,10 @@ use crate::state::{AppState, CANVAS_PANEL_PREFIX, EngineHandle};
 use crate::theme::Theme;
 
 use super::emulator::{CellSnapshot, CursorSnapshot, Emulator, GridPoint, SelectionType, Side};
+use super::keys::key_bytes;
 use super::view::{
     COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
-    cell_at, keystroke_bytes, paste_bytes, terminal_panel_bg,
+    cell_at, paste_bytes, terminal_panel_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
@@ -983,11 +984,15 @@ impl TerminalPanel {
             cx.stop_propagation();
             return;
         }
-        let app_cursor = self
-            .active_tab(cx)
-            .map(|tab| tab.emulator.app_cursor_mode())
-            .unwrap_or(false);
-        if let Some(bytes) = keystroke_bytes(&ks.key, ks.key_char.as_deref(), mods, app_cursor) {
+        let bytes = self.active_tab(cx).and_then(|tab| {
+            key_bytes(
+                tab.emulator.terminal(),
+                &ks.key,
+                ks.key_char.as_deref(),
+                mods,
+            )
+        });
+        if let Some(bytes) = bytes {
             self.queue_input(&bytes, cx);
             cx.stop_propagation();
         }
