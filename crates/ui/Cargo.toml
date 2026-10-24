@@ -9,6 +9,7 @@ publish.workspace = true
 voice-experimental = [] # Compatibility flag; native subscription voice uses Codex's packaged helper.
 project-palette-fixture = []
 compact-picker-fixture = ["gpui_platform/test-support"]
+terminal-fixture = ["gpui_platform/test-support"]
 
 # Native captures explicitly present the freshly drawn scene, including when
 # a nested Wayland compositor has stopped requesting idle frames.
@@ -57,6 +58,10 @@ required-features = ["project-palette-fixture"]
 [[example]]
 name = "sidebar-fixture"
 required-features = ["project-palette-fixture"]
+
+[[example]]
+name = "terminal-fixture"
+required-features = ["terminal-fixture"]
 
 [[example]]
 name = "compact-picker-fixture"
