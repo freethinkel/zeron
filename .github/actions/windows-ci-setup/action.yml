@@ -57,3 +57,6 @@ runs:
         # opt-level 0, so keep them out of the cache. Each job gets its own
         # cache (rust-cache keys on the job id by default).
         cache-workspace-crates: false
+    - name: Ghostty source for libghostty-vt
+      shell: pwsh
+      run: ./scripts/ci/ghostty-source.ps1
