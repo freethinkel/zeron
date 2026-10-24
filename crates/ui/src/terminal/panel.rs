@@ -39,7 +39,7 @@ use super::links::{self, Link, link_modifier};
 use super::mouse::{self, MouseEncoder};
 use super::view::{
     COALESCE_MS, InputCoalescer, RESIZE_DEBOUNCE_MS, SELECTION_DRAG_THRESHOLD, TerminalElement,
-    cell_at, paste_bytes, terminal_panel_bg,
+    cell_at, dropped_paths, paste_bytes, terminal_panel_bg,
 };
 
 /// Fixed tab width — drag-reorder math stays analytic.
@@ -1002,11 +1002,15 @@ impl TerminalPanel {
         let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) else {
             return;
         };
+        self.paste(&text, cx);
+    }
+
+    fn paste(&mut self, text: &str, cx: &mut Context<Self>) {
         let bracketed = self
             .active_tab(cx)
             .map(|tab| tab.emulator.bracketed_paste_mode())
             .unwrap_or(false);
-        let bytes = paste_bytes(&text, bracketed);
+        let bytes = paste_bytes(text, bracketed);
         self.queue_input(&bytes, cx);
     }
 
@@ -2101,6 +2105,13 @@ impl Render for TerminalPanel {
                         },
                     ))
                     .when(self.hover_link.is_some(), |el| el.cursor_pointer())
+                    // Files from Finder: their paths, pasted.
+                    .on_drop(
+                        cx.listener(|this, paths: &gpui::ExternalPaths, window, cx| {
+                            window.focus(&this.focus_handle, cx);
+                            this.paste(&dropped_paths(paths.paths()), cx);
+                        }),
+                    )
                     .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, _, cx| {
                         let lines = match event.delta {
                             ScrollDelta::Lines(delta) => delta.y,
@@ -2425,6 +2436,47 @@ mod tests {
                 "file:///repo/src/main.rs:12".to_string()
             )]
         );
+    }
+
+    /// Files dropped on the terminal paste their escaped paths, bracketed
+    /// when the program asked for it.
+    #[gpui::test]
+    fn dropped_files_paste_their_paths(cx: &mut gpui::TestAppContext) {
+        use gpui::{AppContext, ExternalPaths, FileDropEvent};
+
+        cx.update(|cx| {
+            gpui_base::init(cx);
+            cx.set_global(Theme::default());
+        });
+        let mut key = 0;
+        let (panel, cx) = cx.add_window_view(|_, cx| {
+            let state = cx.new(|_| {
+                let mut state = AppState::new();
+                state.selected_chat = Some("chat".into());
+                state
+            });
+            let mut panel = TerminalPanel::new(state, cx);
+            key = panel.reserve_tab_for_chat("chat".into(), "Shell", cx);
+            let tab = panel.tab_mut("chat", key).unwrap();
+            tab.emulator.feed(b"\x1b[?2004h");
+            panel
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        let to = panel.read_with(cx, |panel, _| panel.geometry.unwrap().bounds.center());
+        let paths = ExternalPaths(vec!["/tmp/a b.png".into(), "/tmp/c.txt".into()].into());
+        cx.simulate_event(FileDropEvent::Entered {
+            position: to,
+            paths,
+        });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_event(FileDropEvent::Pending { position: to });
+        cx.update(|window, cx| window.draw(cx).clear());
+        cx.simulate_event(FileDropEvent::Submit { position: to });
+        cx.run_until_parked();
+        let sent = panel.update(cx, |panel, _| {
+            panel.tab_mut("chat", key).unwrap().coalescer.take()
+        });
+        assert_eq!(sent, b"\x1b[200~/tmp/a\\ b.png /tmp/c.txt\x1b[201~");
     }
 
     #[test]

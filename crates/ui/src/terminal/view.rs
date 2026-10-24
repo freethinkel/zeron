@@ -1,7 +1,8 @@
 //! Terminal paint + input encoding.
 //!
 //! - theme-owned background/ANSI16 plus the xterm 256-color cube/grayscale;
-//! - paste encoding (keystrokes go through Ghostty's encoder in [`super::keys`]);
+//! - paste encoding and dropped files' paths (keystrokes go through
+//!   Ghostty's encoder in [`super::keys`]);
 //! - the 12 ms input coalescer and the 80 ms resize debounce constants (the
 //!   panel drives the timers; the buffer logic here is pure);
 //! - [`TerminalElement`] — a custom gpui element that measures cell metrics
@@ -217,6 +218,25 @@ pub fn paste_bytes(text: &str, bracketed: bool) -> Vec<u8> {
     } else {
         sanitized.into_bytes()
     }
+}
+
+/// Files dropped on the terminal, as text: each path shell-escaped with
+/// backslashes and space-separated, as Ghostty does, so a shell or an agent
+/// TUI (Claude Code picks up image paths) reads them whole.
+pub fn dropped_paths<P: AsRef<std::path::Path>>(paths: &[P]) -> String {
+    let escape = |p: &P| {
+        p.as_ref()
+            .to_string_lossy()
+            .chars()
+            .fold(String::new(), |mut out, c| {
+                if c.is_whitespace() || "\\'\"`$&|;<>()[]{}*?!#~".contains(c) {
+                    out.push('\\');
+                }
+                out.push(c);
+                out
+            })
+    };
+    paths.iter().map(escape).collect::<Vec<_>>().join(" ")
 }
 
 // ---------------------------------------------------------------------------
@@ -880,6 +900,19 @@ mod tests {
         assert_eq!(
             paste_bytes("a\x1b[201~rm -rf", true),
             b"\x1b[200~arm -rf\x1b[201~".to_vec()
+        );
+    }
+
+    #[test]
+    fn dropped_paths_are_escaped_and_joined() {
+        assert_eq!(
+            dropped_paths(&["/tmp/a.png", "/Users/me/My Shot (1).png", "/x/it's $HOME"]),
+            r"/tmp/a.png /Users/me/My\ Shot\ \(1\).png /x/it\'s\ \$HOME"
+        );
+        // As a paste: bracketed when the program asked for it.
+        assert_eq!(
+            paste_bytes(&dropped_paths(&["/a b"]), true),
+            b"\x1b[200~/a\\ b\x1b[201~".to_vec()
         );
     }
 

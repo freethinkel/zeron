@@ -11800,7 +11800,9 @@ impl Shell {
                     })
                     .child(self.render_terminal_container(terminal_geometry, window, cx))
             })
-            .child(Self::attachment_drop_overlay(theme))
+            // The terminal dock takes its own drops (the paths, pasted), so
+            // the hint stops above it.
+            .child(Self::attachment_drop_overlay(theme).bottom(px(term_h)))
             .child(Self::mention_drop_overlay(theme))
             .into_any_element()
     }
