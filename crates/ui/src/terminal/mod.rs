@@ -1,4 +1,4 @@
-//! Terminal panel (feature-inventory §1.10): an `alacritty_terminal`-backed
+//! Terminal panel (feature-inventory §1.10): a libghostty-vt-backed
 //! emulator fed by the engine's PTY stream over the generic RPC client.
 //!
 //! - [`emulator`] — pure Term + vte state machine (bytes in, grid out);

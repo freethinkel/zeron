@@ -221,9 +221,9 @@ feature spec `docs/research/feature-inventory.md` §1.
   images, QuestionPanel (paged, 1-9 keys, 220ms auto-advance) replacing the composer while input
   is requested. Pickers (harness/model, traits, repo w/ folder browser, branch w/ worktree
   toggle) as gpui popovers with `menu-in` scale/fade.
-- **Terminal**: `alacritty_terminal` (vte state machine, MIT/Apache) + `portable-pty` on the
-  engine side; custom gpui grid element; tabs w/ drag-reorder (150ms sliding transforms), height
-  drag 160px–55vh, 12ms input coalescing / 80ms resize debounce, 1MB replay, detach ≠ close.
+- **Terminal**: Ghostty's libghostty-vt (`ghostty-vt`, built with Zig 0.16, MIT) + `portable-pty`
+  on the engine side; custom gpui grid element; tabs w/ drag-reorder (150ms sliding transforms),
+  height drag 160px–55vh, 12ms input coalescing / 80ms resize debounce, 1MB replay, detach ≠ close.
 - **Diff pane**: unified-patch parser → virtualized file/hunk/line rows, per-file collapse
   (180ms height tween), time-sliced highlight, 200ms width transition on the pane itself.
 - **Animation kit** (`zeron-ui::motion`): small helpers over gpui `Animation` reproducing the
